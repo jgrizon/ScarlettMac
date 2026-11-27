@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 15:59:49 -0500
+Subject: [PATCH 07/15] diagnostics: VICTORY_WAVE_WHY explains wave64 retries
+ and first-lane refusals
+
+With VICTORY_WAVE_WHY set, a refused wave64 compute program logs what the
+direct lowering said, then each early-out/skip form it tries (translated
+or refused), and a first-lane refusal logs the instruction's offset, the
+value and the instruction that defined it. For attributing the remaining
+first_lane_across refusals to their instruction classes.
+---
+ crates/victory-shader/src/emit/lower.rs | 19 +++++++++++++++++++
+ crates/victory-shader/src/emit/mod.rs   | 24 ++++++++++++++++++------
+ 2 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index c31f4c2..c486b34 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -7385,6 +7385,25 @@ impl<'a> Lower<'a> {
+                         if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
+                 {
+                     if !self.across_here() {
++                        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
++                            let from = v.src.first().and_then(|op| match *op {
++                                Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
++                                _ => None,
++                            });
++                            let def = from.and_then(|x| {
++                                self.x.p.blocks.iter().flat_map(|b| &b.insts).find_map(|i| {
++                                    i.writes.iter().find(|w| w.1 == x).map(|w| (i.name(), i.machine.offset, w.0))
++                                })
++                            });
++                            eprintln!(
++                                "FIRST_ACROSS at {:#x}: from {:?} defined by {:?}; block {} step={}",
++                                inst.machine.offset,
++                                from,
++                                def,
++                                self.cur_ir,
++                                self.step.get(self.cur_ir).copied().unwrap_or(false)
++                            );
++                        }
+                         return Err(halves::FIRST_ACROSS);
+                     }
+                     let a = s(self, 0)?;
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 07e2700..e3b40be 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -857,11 +857,15 @@ fn emit_pruned(
+         // out, which is what usually keeps the whole body from being a block
+         // every lane runs. Ported from Belobug PR #82.
+         Err(e) if native.stage == HwStage::Cs && native.wave64 && options.host_wave32 => {
++            let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
++            if why {
++                eprintln!("WAVE64-RETRY direct: {e}");
++            }
+             let mut kept = Err(e);
+-            'forms: for form in [
+-                ir::without_early_outs(p),
+-                ir::without_skips(p, false),
+-                ir::without_skips(p, true),
++            for (form_name, form) in [
++                ("without early-outs", ir::without_early_outs(p)),
++                ("without skips", ir::without_skips(p, false)),
++                ("without skips, deep", ir::without_skips(p, true)),
+             ] {
+                 let Some(p) = form else { continue };
+                 let Ok(st) = structure::structure(&p) else {
+@@ -896,10 +900,18 @@ fn emit_pruned(
+                 );
+                 match again {
+                     Ok(l) => {
++                        if why {
++                            eprintln!("WAVE64-RETRY {form_name}: translated");
++                        }
+                         kept = Ok(l);
+-                        break 'forms;
++                        break;
++                    }
++                    Err(e) => {
++                        if why {
++                            eprintln!("WAVE64-RETRY {form_name}: {e}");
++                        }
++                        kept = Err(e);
+                     }
+-                    Err(e) => kept = Err(e),
+                 }
+             }
+             kept?

@@ -1,0 +1,983 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 15:10:31 -0500
+Subject: [PATCH 01/15] Checkpoint base on upstream bf99e72: patches 0001-0005
+ and the DirectStorage held-read release
+
+---
+ apps/victory/src/main.rs                    |   2 +-
+ apps/victory/src/run.rs                     |  20 +-
+ crates/victory-game/src/lib.rs              |   9 +
+ crates/victory-gpu/src/caption.rs           |  10 +-
+ crates/victory-gpu/src/host.rs              |   6 +-
+ crates/victory-gpu/src/lib.rs               |   4 +-
+ crates/victory-gpu/src/queue.rs             |   5 +
+ crates/victory-gpu/src/ranges.rs            |   9 +-
+ crates/victory-gpu/src/watch.rs             |  54 ++++-
+ crates/victory-hle/src/modules/dstorage.rs  | 240 +++++++++++++++++++-
+ crates/victory-hle/src/modules/gameinput.rs | 184 ++++++++++++++-
+ docs/macos.md                               |   3 +-
+ 12 files changed, 503 insertions(+), 43 deletions(-)
+
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index 0210809..31c1add 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -22,7 +22,7 @@ use clap::{Parser, Subcommand, ValueEnum};
+ #[command(
+     name = "victory",
+     version,
+-    about = "Run an Xbox Series title natively on Windows"
++    about = "ScarlettMac Runtime Preview for Xbox Series titles"
+ )]
+ struct Cli {
+     #[command(subcommand)]
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index 25661c7..148c739 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -80,6 +80,15 @@ pub fn run(
+     println!("masked stores  {}", victory_loader::masked::summary(&masked));
+     // Under Rosetta, tracking is off unless asked for, and the stores it
+     // cannot resume are patched when it is on (`victory_gpu::fault_tracking`).
++    // A build whose plain 256-bit stores are listed has all of them patched
++    // too, so for it tracking runs by default: refreshes then copy the pages
++    // the title wrote instead of whole copies (174 MB a submission through
++    // the loading screens). An explicit variable still wins.
++    let unforced = std::env::var("VICTORY_FAULT_TRACKING").is_err()
++        && std::env::var("VICTORY_PATCH_MASKED").is_err();
++    if unforced && victory_gpu::rosetta() && known.is_some_and(|b| !b.plain_stores.is_empty()) {
++        victory_gpu::set_fault_tracking(true);
++    }
+     println!(
+         "fault tracking {}",
+         if victory_gpu::fault_tracking() {
+@@ -94,15 +103,14 @@ pub fn run(
+     // masked stores after the mapping.
+     let needs_patch = victory_gpu::stores_need_patching();
+     let mut requested = std::env::var("VICTORY_PATCH_MASKED").ok();
+-    // Rosetta can also fault midway through plain 256-bit vector stores in
+-    // a few loops (#144). Their offsets are specific to Series 1.0.2.1, so
+-    // they are added here only for that build, and an explicit
+-    // `VICTORY_PATCH_MASKED` always wins.
++    // Rosetta can also fault midway through plain 256-bit vector stores in a
++    // few loops (#144), which the scan does not look for: the build lists
++    // their RVAs. An explicit `VICTORY_PATCH_MASKED` always wins.
+     if needs_patch
+         && requested.is_none()
+-        && hash.as_str() == "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93"
++        && let Some(build) = known.filter(|b| !b.plain_stores.is_empty())
+     {
+-        requested = Some("all,1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05".into());
++        requested = Some(format!("all,{}", build.plain_stores));
+     }
+     let patching = victory_loader::masked::choice(requested, needs_patch);
+     let original = patching.is_some().then_some(original);
+diff --git a/crates/victory-game/src/lib.rs b/crates/victory-game/src/lib.rs
+index 2f3734e..a03a84b 100644
+--- a/crates/victory-game/src/lib.rs
++++ b/crates/victory-game/src/lib.rs
+@@ -23,6 +23,12 @@ pub struct KnownBuild {
+     /// not finished a frame for 30 checks, which a world load streamed from
+     /// slow storage and the first world frames outlast (#135).
+     pub hang_watchdog: &'static [CodePatch],
++    /// Other RVAs of plain vector stores Rosetta cannot resume after a fault,
++    /// to patch along with every masked store the loader's scan finds (the
++    /// `VICTORY_PATCH_MASKED` values after `all`): fault tracking stays off
++    /// under Rosetta without them, and with them the runtime turns it on.
++    /// Empty for a build whose stores the scan covers.
++    pub plain_stores: &'static str,
+ }
+ 
+ /// Bytes to replace at an RVA of the mapped image, applied only where the
+@@ -59,6 +65,9 @@ pub const KNOWN_BUILDS: &[KnownBuild] = &[KnownBuild {
+             replacement: &[0x66, 0x90],
+         },
+     ],
++    // `vmovups`/`vmovupd`/`vmovdqu` stores that begin in writable memory and
++    // run into a protected page, which Rosetta cannot resume either (#144).
++    plain_stores: "1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05",
+ }];
+ 
+ /// Looks up a build by the BLAKE3 hash of its executable.
+diff --git a/crates/victory-gpu/src/caption.rs b/crates/victory-gpu/src/caption.rs
+index 643c56e..0086e6e 100644
+--- a/crates/victory-gpu/src/caption.rs
++++ b/crates/victory-gpu/src/caption.rs
+@@ -1,6 +1,6 @@
+ //! The visible window caption: the title's text followed by our statistics.
+ 
+-const SEPARATOR: &str = " | VIctory ";
++const SEPARATOR: &str = " | ScarlettMac ";
+ 
+ /// Replaces the suffix left by an earlier presenter. A replacement swap
+ /// chain reads the visible caption, which already contains that suffix.
+@@ -23,7 +23,7 @@ pub(crate) fn with_stats(caption: &[u16], stats: &str) -> Vec<u16> {
+ }
+ 
+ /// Whether `text` has the exact shape Meter appends. The separator alone is
+-/// not enough: a title's own caption may contain ` | VIctory `.
++/// not enough: a title's own caption may contain ` | ScarlettMac `.
+ fn looks_like_stats(text: &[u16]) -> bool {
+     let Ok(text) = String::from_utf16(text) else {
+         return false;
+@@ -48,20 +48,20 @@ mod tests {
+ 
+     #[test]
+     fn statistics_replace_the_previous_suffix_and_preserve_the_base_title() {
+-        let base = "Synthetic base | VIctory base | window";
++        let base = "Synthetic base | ScarlettMac base | window";
+         let mut caption: Vec<u16> = base.encode_utf16().collect();
+ 
+         caption = with_stats(&caption, "0 fps 2973.1 ms/frame 4456 draws/frame");
+         assert_eq!(
+             text(&caption),
+-            "Synthetic base | VIctory base | window | VIctory 0 fps 2973.1 ms/frame 4456 draws/frame"
++            "Synthetic base | ScarlettMac base | window | ScarlettMac 0 fps 2973.1 ms/frame 4456 draws/frame"
+         );
+ 
+         // A replacement presenter reads the caption left by the previous one.
+         caption = with_stats(&caption, "1 fps 1425.4 ms/frame 4715 draws/frame");
+         assert_eq!(
+             text(&caption),
+-            "Synthetic base | VIctory base | window | VIctory 1 fps 1425.4 ms/frame 4715 draws/frame"
++            "Synthetic base | ScarlettMac base | window | ScarlettMac 1 fps 1425.4 ms/frame 4715 draws/frame"
+         );
+     }
+ }
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 5d7ad46..3655305 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -3630,8 +3630,12 @@ impl Batch {
+                 #[cfg(feature = "diagnostics")]
+                 {
+                     counted.range(from, to - from, us, 0);
++                    // What the refresh copied, not what it was asked for:
++                    // tracked memory copies the pages the title wrote, a few
++                    // of a 174 MB range this line would otherwise call
++                    // copied.
+                     self.summary
+-                        .record(from as u64, (to - from) as u64, shadow.gpu(from as u64));
++                        .record(from as u64, copied as u64, shadow.gpu(from as u64));
+                 }
+                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index ed3eb24..1d416c4 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -98,8 +98,8 @@ pub use alias::{PhysicalHeap, physical_heap};
+ pub use host::{MeshSupport, host_mesh_support, on_failure};
+ #[cfg(windows)]
+ pub use watch::{
+-    Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
+-    title_memory_remapped, writing as kernel_will_write,
++    Writing as KernelWrite, fault_tracking, rosetta, set_fault_tracking, stores_need_patching,
++    title_memory_aliased, title_memory_remapped, writing as kernel_will_write,
+ };
+ 
+ /// [`shader_cache::under_wine`], asked once: it looks `wine_get_version` up
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index 7a71c08..d70d544 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -481,6 +481,11 @@ pub(crate) fn presented() -> u64 {
+     FRAMES.load(Ordering::Relaxed)
+ }
+ 
++#[cfg(feature = "diagnostics")]
++pub fn diagnostic_present_serial() -> u64 {
++    presented()
++}
++
+ /// Every plane's resources. Only the start of a plane description is
+ /// known (token, count, resources), so the planes after the first are
+ /// found by their stride: the first offset past the first plane where the
+diff --git a/crates/victory-gpu/src/ranges.rs b/crates/victory-gpu/src/ranges.rs
+index da43858..da43e40 100644
+--- a/crates/victory-gpu/src/ranges.rs
++++ b/crates/victory-gpu/src/ranges.rs
+@@ -81,10 +81,12 @@ impl Ranges {
+ #[cfg(any(feature = "diagnostics", test))]
+ const REFRESH_TOP: usize = 8;
+ 
+-/// A bounded summary of the ranges a submission refreshed into host shadows.
++/// A bounded summary of the bytes a submission copied into host shadows.
+ /// The ranges are attributed only to their host copy: a batch combines
+ /// requests from lists, view heaps and page tables, and does not retain a
+-/// reliable descriptor or view owner for each range.
++/// reliable descriptor or view owner for each range. (The bytes are those a
++/// refresh copied, not the range it was asked for: with tracking a 174 MB
++/// range copies only the pages the title wrote.)
+ #[cfg(any(feature = "diagnostics", test))]
+ #[derive(Default)]
+ pub(crate) struct RefreshSummary {
+@@ -121,7 +123,8 @@ impl PartialOrd for RefreshedRange {
+ 
+ #[cfg(any(feature = "diagnostics", test))]
+ impl RefreshSummary {
+-    /// Counts a range of `len` title bytes and where it lands in host memory.
++    /// Counts `copied` bytes of a refresh range starting at `title` and
++    /// where it lands in host memory.
+     pub(crate) fn record(&mut self, title: u64, len: u64, host_gpu: u64) {
+         self.bytes = self.bytes.saturating_add(len);
+         self.ranges = self.ranges.saturating_add(1);
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index e0afc0f..b63cf4d 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -35,7 +35,8 @@
+ //! and allocated again while a tracker holds it is not seen.
+ //!
+ //! Under Rosetta (Wine on macOS) memory is tracked only when asked for, with
+-//! the stores Rosetta cannot resume rewritten at load time: see
++//! the stores Rosetta cannot resume rewritten at load time; the runtime asks
++//! for it by default for a title build whose stores are all patched: see
+ //! [`fault_tracking`].
+ 
+ use std::collections::{BTreeMap, BTreeSet};
+@@ -54,11 +55,16 @@ use std::sync::{Arc, LazyLock, Mutex};
+ /// ([`stores_need_patching`]). Earlier Rosetta also stops on a plain 32-byte
+ /// `vmovups` across pages (macOS 26.6, #1), and #144 hung on an M1 with
+ /// both switches on, so under Rosetta tracking stays off unless
+-/// `VICTORY_FAULT_TRACKING=1` asks for it. Without tracking, copies take
+-/// their memory whole every time, as they do for memory that is not the
+-/// runtime's (tens of GB per world frame, #50). `0` turns tracking off
+-/// anywhere. Tests keep it on: their stores do not cross pages.
++/// `VICTORY_FAULT_TRACKING=1` asks for it, or the runtime asks with
++/// [`set_fault_tracking`] because the loader patches every store of this
++/// build that Rosetta cannot resume. Without tracking, copies take their
++/// memory whole every time, as they do for memory that is not the runtime's
++/// (tens of GB per world frame, #50). `0` turns tracking off anywhere. Tests
++/// keep it on: their stores do not cross pages.
+ pub fn fault_tracking() -> bool {
++    if let Some(on) = forced() {
++        return on;
++    }
+     static ON: LazyLock<bool> = LazyLock::new(|| {
+         decide(
+             std::env::var("VICTORY_FAULT_TRACKING").ok().as_deref(),
+@@ -68,6 +74,37 @@ pub fn fault_tracking() -> bool {
+     *ON
+ }
+ 
++/// Whether the runtime asked for tracking with [`set_fault_tracking`] (0: no,
++/// 1: off, 2: on). Set once, before the first question: the loader patches
++/// the title's stores only when tracking is on, so the runtime turns it on
++/// first and then patches.
++static FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
++
++/// Turns tracking on (or off) for the rest of the run, as
++/// `VICTORY_FAULT_TRACKING` would: the runtime calls it when the loader will
++/// patch every store of the title that Rosetta cannot resume after a fault.
++/// An explicit `VICTORY_FAULT_TRACKING` still wins (the runtime asks only
++/// when it is unset), and this is not meant to be called after memory has
++/// been tracked: the runtime calls it before loading the title.
++pub fn set_fault_tracking(on: bool) {
++    FORCED.store(if on { 2 } else { 1 }, Ordering::Release);
++}
++
++/// [`fault_tracking`]'s answer from the runtime's request, if it made one.
++fn forced() -> Option<bool> {
++    forced_from(FORCED.load(Ordering::Acquire))
++}
++
++/// [`forced`] from the stored value: a separate function, so a test can ask
++/// without changing the answer the crate's other tests get.
++fn forced_from(value: u8) -> Option<bool> {
++    match value {
++        0 => None,
++        1 => Some(false),
++        _ => Some(true),
++    }
++}
++
+ /// Whether tracking runs under Rosetta, so the stores Rosetta cannot resume
+ /// after a fault must be rewritten at load time (`victory_loader::masked`).
+ pub fn stores_need_patching() -> bool {
+@@ -1275,6 +1312,13 @@ pub(crate) mod tests {
+         assert!(fault_tracking() || std::env::var("VICTORY_FAULT_TRACKING").as_deref() == Ok("0"));
+     }
+ 
++    #[test]
++    fn a_run_can_turn_tracking_on_before_any_memory_is_tracked() {
++        assert_eq!(super::forced_from(0), None);
++        assert_eq!(super::forced_from(1), Some(false));
++        assert_eq!(super::forced_from(2), Some(true));
++    }
++
+     #[test]
+     fn tracking_is_opt_in_under_rosetta() {
+         // The variable decides when it is set; otherwise tracking is on
+diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
+index fa5d178..26bcbe6 100644
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -274,9 +274,13 @@ type Array = *mut Instance<StatusArray>;
+ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
+     // SAFETY: an array we created and the title still holds.
+     let entries = &unsafe { &*this }.state.entries;
+-    entries
++    let result = entries
+         .get(index as usize)
+-        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
++        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire));
++    if result == E_PENDING && let Some(scheduler) = scheduler() {
++        scheduler.lock().note_poll(index);
++    }
++    result
+ }
+ 
+ /// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
+@@ -348,6 +352,15 @@ struct Lanes {
+     /// Requests into physical pages.
+     pages: u64,
+     since: Option<std::time::Instant>,
++    /// When a request last started or finished, or a command was enqueued
++    /// or submitted, and whether the queues being idle since then was said.
++    moved: std::time::Instant,
++    said_idle: Option<std::time::Instant>,
++
++    /// Status entries the title polled while pending, and since when.
++    polls: u64,
++    polling_since: Option<std::time::Instant>,
++    said_polling: bool,
+ }
+ 
+ /// A queue's requests in the scheduler.
+@@ -368,6 +381,11 @@ struct Lane {
+     running: BTreeSet<u64>,
+     failures: BTreeMap<u64, HRESULT>,
+     closed: bool,
++    /// Since when reads into physical pages wait for the title's Submit.
++    held_since: Option<std::time::Instant>,
++    /// A batch of 64 requests or more waiting, since when: said once it
++    /// finishes, so a load's streaming shows its ends.
++    batch: Option<(usize, std::time::Instant)>,
+ }
+ 
+ // SAFETY: requests point into title memory and our own objects, which stay
+@@ -409,6 +427,11 @@ fn scheduler() -> Option<&'static Scheduler> {
+                     bcpack: Default::default(),
+                     pages: 0,
+                     since: None,
++                    moved: std::time::Instant::now(),
++                    said_idle: None,
++                    polls: 0,
++                    polling_since: None,
++                    said_polling: false,
+                 }),
+                 work: Condvar::new(),
+                 finished: Condvar::new(),
+@@ -432,16 +455,119 @@ fn scheduler() -> Option<&'static Scheduler> {
+             })
+             .count();
+         tracing::info!(workers = started, "dstorage: workers");
++        // A queue the title waits on and nothing fills is invisible
++        // otherwise: requests only log when they finish.
++        let _ = std::thread::Builder::new()
++            .name("dstorage watch".into())
++            .spawn(|| watch(scheduler));
+     });
+     Some(scheduler)
+ }
+ 
++/// Says what the queues hold when nothing has started or finished for a
++/// while (a wait nothing ends).
++fn watch(scheduler: &'static Scheduler) {
++    loop {
++        std::thread::sleep(std::time::Duration::from_secs(1));
++        let mut lanes = scheduler.lock();
++        lanes.release_held(hold_delay());
++        lanes.report_stuck();
++    }
++}
++
+ impl Scheduler {
+     fn lock(&self) -> MutexGuard<'_, Lanes> {
+         self.lanes.lock().unwrap_or_else(|e| e.into_inner())
+     }
+ }
+ 
++/// How long the queues may hold work with nothing starting or finishing
++/// before the watchdog says what they hold.
++const STUCK: std::time::Duration = std::time::Duration::from_secs(5);
++/// How long the title may poll a pending status entry before that is said.
++const POLLING: std::time::Duration = std::time::Duration::from_secs(2);
++
++impl Lanes {
++    /// A request started or finished, or a command was enqueued or
++    /// submitted: the queues are moving.
++    fn moved(&mut self) {
++        self.moved = std::time::Instant::now();
++        self.said_idle = None;
++        self.polls = 0;
++        self.polling_since = None;
++        self.said_polling = false;
++    }
++
++    /// The title asked for a status entry still pending. Grand Theft Auto VI
++    /// polls entry 0 in a `Sleep(1)` loop and never reads the result, so a
++    /// poll that goes on means the load waits for these reads.
++    fn note_poll(&mut self, index: u32) {
++        self.polls += 1;
++        let since = *self.polling_since.get_or_insert_with(std::time::Instant::now);
++        let held = since.elapsed();
++        if held < POLLING || self.said_polling {
++            return;
++        }
++        self.said_polling = true;
++        tracing::info!(
++            index,
++            polls = self.polls,
++            seconds = format_args!("{:.1}", held.as_secs_f64()),
++            "dstorage: the title polls a status entry that is still pending"
++        );
++        self.say_lanes("a queue holds what the title polls for");
++        // The title is waiting on this entry: whatever reads stand in front
++        // of it must run, or nothing after them ever will.
++        self.release_held(std::time::Duration::ZERO);
++    }
++
++    /// Says what the queues hold when nothing has moved for [`STUCK`], every
++    /// 30 s while it lasts.
++    fn report_stuck(&mut self) {
++        if !self.lanes.values().any(|l| l.entries() > 0) {
++            self.said_idle = None;
++            return;
++        }
++        if self.moved.elapsed() < STUCK {
++            return;
++        }
++        if self.said_idle.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(30)) {
++            return;
++        }
++        self.said_idle = Some(std::time::Instant::now());
++        self.say_lanes("no request started or finished");
++    }
++
++    /// One info line per queue with work left, with the ages that say what
++    /// it waits for: `why` names the wait.
++    fn say_lanes(&self, why: &str) {
++        let idle = self.moved.elapsed().as_secs_f64() * 1e3;
++        for (&id, lane) in &self.lanes {
++            if lane.entries() == 0 {
++                continue;
++            }
++            let held_ms = lane.held_since.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3);
++            let batch = lane.batch.map(|(n, _)| n).unwrap_or(0);
++            tracing::info!(
++                queue = id,
++                class = lane.class,
++                capacity = lane.capacity,
++                unsubmitted = lane.unsubmitted.len(),
++                held = lane.held.len(),
++                reads = lane.reads.len(),
++                statuses = lane.statuses.len(),
++                running = lane.running.len(),
++                failures = lane.failures.len(),
++                batch,
++                held_ms,
++                staged_mb = format_args!("{:.1}", self.staged as f64 / 1e6),
++                idle_ms = format_args!("{:.0}", idle),
++                "dstorage: {why}"
++            );
++        }
++    }
++}
++
+ /// A worker: runs the next read of the most deserving queue.
+ fn work(scheduler: &'static Scheduler) {
+     let mut lanes = scheduler.lock();
+@@ -533,6 +659,7 @@ impl Lanes {
+         self.clock[class] += size * COST[class];
+         self.lane_now[class] = lane.clock;
+         lane.clock += size;
++        self.moved();
+         Some(Job {
+             lane: id,
+             seq,
+@@ -549,23 +676,49 @@ impl Lanes {
+                 lane.failures.insert(job.seq, hr);
+             }
+             lane.flush();
++            if lane.entries() == 0 && let Some((requests, at)) = lane.batch.take() {
++                tracing::info!(
++                    requests,
++                    seconds = format_args!("{:.1}", at.elapsed().as_secs_f64()),
++                    "dstorage: a batch of reads finished"
++                );
++            }
+         }
++        self.moved();
+     }
+ 
+     /// Moves a queue's enqueued commands to the workers (the title's
+     /// Submit).
+     fn submit(&mut self, id: u64) {
+-        self.submit_as(id, true);
++        self.submit_as(id, By::Title);
+     }
+ 
+-    /// As [`Lanes::submit`]; `explicit` false when a half-full queue submits
++    /// Starts the reads a queue has held for the title's Submit for longer
++    /// than `older`: a Submit that never comes is a load that never
++    /// finishes, and the console's hardware would have run them already.
++    fn release_held(&mut self, older: std::time::Duration) {
++        let ids: Vec<u64> = self
++            .lanes
++            .iter()
++            .filter(|(_, l)| !l.held.is_empty() && l.held_since.is_some_and(|t| t.elapsed() >= older))
++            .map(|(&id, _)| id)
++            .collect();
++        for id in ids {
++            self.submit_as(id, By::Late);
++        }
++    }
++
++    /// As [`Lanes::submit`]; [`By::Auto`] when a half-full queue submits
+     /// itself, which leaves reads into physical pages for the title's
+     /// Submit: their page lists point into the title's page table, which
+     /// Grand Theft Auto VI fills for the batch in its own submit path, right
+     /// before Submit (`sub_1400e88f0`), so until then they name no page or a
+     /// page that now holds something else. A status entry behind a held
+-    /// read waits with it.
+-    fn submit_as(&mut self, id: u64, explicit: bool) {
++    /// read waits with it, so a Submit that never comes holds the status the
++    /// title polls. [`By::Late`] starts them anyway once
++    /// [`VICTORY_DSTORAGE_HOLD_MS`] has passed; a list the title has not
++    /// filled yet is read again there (`into_destination`).
++    fn submit_as(&mut self, id: u64, by: By) {
+         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
+             return;
+         };
+@@ -584,15 +737,28 @@ impl Lanes {
+         if lane.reads.is_empty() {
+             lane.clock = lane.clock.max(self.lane_now[class]);
+         }
++        let explicit = by != By::Auto;
+         let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
++        if !commands.is_empty() {
++            let held = commands.len();
++            let waited = lane.held_since.take().map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3);
++            tracing::info!(
++                held,
++                waited_ms = waited,
++                by = by.name(),
++                "dstorage: reads held for a Submit start"
++            );
++        }
+         commands.append(&mut lane.unsubmitted);
++        let hold_page_reads = by == By::Auto && hold_delay() > std::time::Duration::ZERO;
+         for command in commands {
+-            let hold = !explicit
++            let hold = hold_page_reads
+                 && match &command {
+                     Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                     Command::Status(_) => !lane.held.is_empty(),
+                 };
+             if hold {
++                lane.held_since.get_or_insert_with(std::time::Instant::now);
+                 lane.held.push(command);
+                 continue;
+             }
+@@ -604,6 +770,8 @@ impl Lanes {
+             }
+         }
+         lane.flush();
++        lane.note_batch();
++        self.moved();
+     }
+ }
+ 
+@@ -620,6 +788,8 @@ impl Lane {
+             running: BTreeSet::new(),
+             failures: BTreeMap::new(),
+             closed: false,
++            held_since: None,
++            batch: None,
+         }
+     }
+ 
+@@ -632,6 +802,16 @@ impl Lane {
+             + self.running.len()
+     }
+ 
++    /// Remembers a batch of 64 entries or more waiting, to say when it ends.
++    fn note_batch(&mut self) {
++        let entries = self.entries();
++        match &mut self.batch {
++            Some(batch) => batch.0 = batch.0.max(entries),
++            None if entries >= 64 => self.batch = Some((entries, std::time::Instant::now())),
++            None => {}
++        }
++    }
++
+     /// Writes the status entries whose earlier reads have all finished.
+     fn flush(&mut self) {
+         while let Some(&(seq, _)) = self.statuses.front() {
+@@ -734,6 +914,40 @@ enum Command {
+     Status(Status),
+ }
+ 
++/// What moved a queue's commands to the workers.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum By {
++    /// The title's `Submit`.
++    Title,
++    /// The queue submitting itself once half full.
++    Auto,
++    /// Held for a Submit that did not come; started once the hold passed.
++    Late,
++}
++
++impl By {
++    fn name(self) -> &'static str {
++        match self {
++            Self::Title => "the title's Submit",
++            Self::Auto => "the queue itself",
++            Self::Late => "the hold's delay",
++        }
++    }
++}
++
++/// How long reads into physical pages wait for the title's Submit before
++/// they start anyway. `VICTORY_DSTORAGE_HOLD_MS`, 0 for as the queue
++/// submits itself.
++fn hold_delay() -> std::time::Duration {
++    static DELAY: OnceLock<std::time::Duration> = OnceLock::new();
++    *DELAY.get_or_init(|| {
++        std::env::var("VICTORY_DSTORAGE_HOLD_MS")
++            .ok()
++            .and_then(|v| v.trim().parse::<u64>().ok())
++            .map_or(std::time::Duration::from_secs(2), std::time::Duration::from_millis)
++    })
++}
++
+ /// A status entry to write, holding a reference on its array.
+ struct Status {
+     array: Array,
+@@ -811,9 +1025,10 @@ fn queue(this: QueueRef, command: Command) {
+         return;
+     };
+     lane.unsubmitted.push(command);
++    lane.note_batch();
+     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+         let capacity = lane.capacity;
+-        lanes.submit_as(id, false);
++        lanes.submit_as(id, By::Auto);
+         scheduler.work.notify_all();
+         let held = lanes.lanes.get(&id).map_or(0, |l| l.held.len());
+         let n = AUTO_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
+@@ -826,6 +1041,8 @@ fn queue(this: QueueRef, command: Command) {
+             );
+         }
+     }
++    // Enqueuing is progress too: a batch of 2,000 takes a while to build.
++    lanes.moved();
+ }
+ 
+ extern "system" fn submit(this: QueueRef) {
+@@ -1398,6 +1615,11 @@ mod tests {
+             bcpack: Default::default(),
+             pages: 0,
+             since: None,
++            moved: std::time::Instant::now(),
++            said_idle: None,
++            polls: 0,
++            polling_since: None,
++            said_polling: false,
+         }
+     }
+ 
+@@ -1692,7 +1914,7 @@ mod tests {
+         read(&mut l, 0, 0, 16);
+         add_ref_instance(array);
+         l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+-        l.submit_as(0, false);
++        l.submit_as(0, By::Auto);
+         // Only the plain read starts; the status waits behind the held one.
+         let plain = l.start().unwrap();
+         assert_eq!(plain.request.options, 0);
+diff --git a/crates/victory-hle/src/modules/gameinput.rs b/crates/victory-hle/src/modules/gameinput.rs
+index e1c0f0d..499b1f8 100644
+--- a/crates/victory-hle/src/modules/gameinput.rs
++++ b/crates/victory-hle/src/modules/gameinput.rs
+@@ -187,6 +187,8 @@ pub struct Device {
+     hub: *const Hub,
+     index: usize,
+     info: DeviceInfo,
++    #[cfg(feature = "diagnostics")]
++    last_stick_read: Mutex<Option<(u64, [i8; 4])>>,
+ }
+ 
+ /// What a device says about itself. The title reads `id` (+0x20); the rest
+@@ -242,6 +244,8 @@ impl Device {
+             hub: std::ptr::null(),
+             index,
+             info,
++            #[cfg(feature = "diagnostics")]
++            last_stick_read: Mutex::new(None),
+         }
+     }
+ 
+@@ -1084,15 +1088,51 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
+     n as u32
+ }
+ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
+-    match &reading(this).value {
++    let reading = reading(this);
++    match &reading.value {
+         Value::Pad(state) if !out.is_null() => {
+             // SAFETY: checked non-null.
+             unsafe { out.write(*state) };
++            #[cfg(feature = "diagnostics")]
++            trace_stick_read(reading, state);
+             true
+         }
+         _ => false,
+     }
+ }
++
++#[cfg(feature = "diagnostics")]
++fn trace_stick_read(reading: &Reading, state: &PadState) {
++    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
++        std::env::var_os("VICTORY_TRACE_RETURNED_STICKS").is_some_and(|value| value == "1")
++    });
++    if !*ENABLED {
++        return;
++    }
++    // SAFETY: the device belongs to the reading's permanently allocated hub.
++    let device = unsafe { &*reading.device };
++    let axes = [state.left_x, state.left_y, state.right_x, state.right_y];
++    let zones = axes.map(|value| i8::from(value >= 0.5) - i8::from(value <= -0.5));
++    let mut last = lock(&device.last_stick_read);
++    if last.is_some_and(|(sequence, _)| reading.sequence <= sequence) {
++        return;
++    }
++    let old = last.replace((reading.sequence, zones));
++    if old.is_some_and(|(_, previous)| previous == zones) {
++        return;
++    }
++    let present_serial = victory_gpu::queue::diagnostic_present_serial();
++    drop(last);
++    tracing::info!(
++        device = device.index,
++        sequence = reading.sequence,
++        present_serial,
++        left = ?[state.left_x, state.left_y],
++        right = ?[state.right_x, state.right_y],
++        "title read stick state",
++    );
++}
++
+ /// Kinds our devices do not have: no count, no state.
+ extern "system" fn nothing(_: *const c_void) -> usize {
+     0
+@@ -1201,6 +1241,42 @@ mod host {
+     #[derive(Default)]
+     pub(super) struct Host {
+         empty_until: [Option<Instant>; PADS],
++        #[cfg(feature = "diagnostics")]
++        confirmed_at: u64,
++        #[cfg(feature = "diagnostics")]
++        confirm_until: Option<Instant>,
++        #[cfg(feature = "diagnostics")]
++        next_confirm_poll: Option<Instant>,
++    }
++
++    #[cfg(feature = "diagnostics")]
++    impl Host {
++        fn poll_confirmation(&mut self) {
++            let now = Instant::now();
++            if let Some(until) = self.confirm_until {
++                if now >= until {
++                    self.confirm_until = None;
++                }
++                return;
++            }
++            if self.next_confirm_poll.is_some_and(|next| now < next) {
++                return;
++            }
++            self.next_confirm_poll = Some(now + Duration::from_millis(50));
++            if let Some(stamp) = confirmation_marker(self.confirmed_at) {
++                self.confirmed_at = stamp;
++                self.confirm_until = Some(now + Duration::from_millis(200));
++                tracing::info!("confirmed offline picker from the local launcher");
++            }
++        }
++
++        fn scripted_with_confirmation(&self) -> Vec<u8> {
++            let mut keys = scripted();
++            if self.confirm_until.is_some() && !keys.contains(&0x0D) {
++                keys.push(0x0D);
++            }
++            keys
++        }
+     }
+ 
+     fn key_state(vk: u8) -> KeyState {
+@@ -1230,6 +1306,9 @@ mod host {
+         }
+ 
+         fn keys(&mut self) -> Vec<KeyState> {
++            #[cfg(feature = "diagnostics")]
++            let mut down = self.scripted_with_confirmation();
++            #[cfg(not(feature = "diagnostics"))]
+             let mut down = scripted();
+             if focused() {
+                 // Left/right modifier keys only, as devices report them; no
+@@ -1248,7 +1327,8 @@ mod host {
+         fn scripted_keys(&mut self) -> Vec<KeyState> {
+             #[cfg(feature = "diagnostics")]
+             {
+-                scripted().into_iter().map(key_state).collect()
++                self.poll_confirmation();
++                self.scripted_with_confirmation().into_iter().map(key_state).collect()
+             }
+             #[cfg(not(feature = "diagnostics"))]
+             {
+@@ -1273,8 +1353,9 @@ mod host {
+     /// In every build, so that unattended runs can get past the title's
+     /// prompts; unset, it holds nothing.
+     fn scripted() -> Vec<u8> {
+-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
++        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
+             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
++            let allow_holds = script_trigger().is_some();
+             let keys = list.split(',').filter_map(|entry| {
+                 let (at, key) = entry.split_once(':')?;
+                 let vk = match key.trim() {
+@@ -1291,21 +1372,104 @@ mod host {
+                     }
+                     _ => return None,
+                 };
+-                Some((
+-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+-                    vk,
+-                ))
++                let time = |value: &str| Duration::try_from_secs_f64(value.trim().parse().ok()?).ok();
++                let (from, to) = if let Some(from) = time(at) {
++                    (from, from.checked_add(Duration::from_millis(200))?)
++                } else if allow_holds {
++                    let (from, to) = at.split_once('-')?;
++                    (time(from)?, time(to)?)
++                } else {
++                    return None;
++                };
++                (from < to).then_some((from, to, vk))
+             });
+             (Instant::now(), keys.collect())
+         });
+         let (start, keys) = &*SCRIPT;
+-        let now = start.elapsed();
++        if keys.is_empty() {
++            return Vec::new();
++        }
++        let Some(now) = scripted_elapsed(*start) else {
++            return Vec::new();
++        };
+         keys.iter()
+-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+-            .map(|&(_, vk)| vk)
++            .filter(|&&(from, to, _)| (from..to).contains(&now))
++            .map(|&(_, _, vk)| vk)
+             .collect()
+     }
+ 
++    #[cfg(feature = "diagnostics")]
++    fn script_trigger() -> Option<&'static std::path::Path> {
++        static PATH: LazyLock<Option<std::path::PathBuf>> =
++            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_TRIGGER").map(std::path::PathBuf::from));
++        PATH.as_deref()
++    }
++
++    #[cfg(feature = "diagnostics")]
++    fn scripted_elapsed(default_start: Instant) -> Option<Duration> {
++        let Some(path) = script_trigger() else {
++            return Some(default_start.elapsed());
++        };
++        static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
++        static CHECKED: Mutex<Option<Instant>> = Mutex::new(None);
++        if let Some(start) = STARTED.get() {
++            return Some(start.elapsed());
++        }
++        let mut checked = lock(&CHECKED);
++        if let Some(start) = STARTED.get() {
++            return Some(start.elapsed());
++        }
++        if checked.is_some_and(|at| at.elapsed() < Duration::from_millis(100)) {
++            return None;
++        }
++        *checked = Some(Instant::now());
++        std::fs::File::open(path).ok()?;
++        let start = STARTED.get_or_init(|| {
++            tracing::info!("started the local GameInput timeline");
++            Instant::now()
++        });
++        Some(start.elapsed())
++    }
++
++    #[cfg(feature = "diagnostics")]
++    fn confirmation_marker(after: u64) -> Option<u64> {
++        use std::io::Read;
++        use std::os::windows::io::AsRawHandle;
++        use std::path::PathBuf;
++        use std::time::{SystemTime, UNIX_EPOCH};
++        use windows_sys::Win32::Foundation::FILETIME;
++        use windows_sys::Win32::Storage::FileSystem::GetFileTime;
++
++        const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
++        const FRESH_TICKS: u64 = 6_000_000;
++        const MAX_TOKEN_BYTES: u64 = 32;
++        static PATH: LazyLock<Option<PathBuf>> =
++            LazyLock::new(|| std::env::var_os("VICTORY_CONFIRM_FILE").map(PathBuf::from));
++        let file = std::fs::File::open(PATH.as_ref()?).ok()?;
++        let mut modified = FILETIME::default();
++        // SAFETY: the file stays open and the output is writable.
++        if unsafe {
++            GetFileTime(
++                file.as_raw_handle(),
++                std::ptr::null_mut(),
++                std::ptr::null_mut(),
++                &mut modified,
++            )
++        } == 0
++        {
++            return None;
++        }
++        let stamp = (u64::from(modified.dwHighDateTime) << 32) | u64::from(modified.dwLowDateTime);
++        let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
++        let now = UNIX_EPOCH_FILETIME.checked_add(u64::try_from(elapsed.as_nanos() / 100).ok()?)?;
++        if stamp <= after || now.checked_sub(stamp)? >= FRESH_TICKS {
++            return None;
++        }
++        let mut token = String::new();
++        let len = file.take(MAX_TOKEN_BYTES + 1).read_to_string(&mut token).ok()?;
++        ((len as u64) <= MAX_TOKEN_BYTES && matches!(token.trim(), "" | "Enter")).then_some(stamp)
++    }
++
+     /// The foreground window is one of ours (the title's or our fallback).
+     fn focused() -> bool {
+         let mut process = 0;
+diff --git a/docs/macos.md b/docs/macos.md
+index e89a841..d52b1dd 100644
+--- a/docs/macos.md
++++ b/docs/macos.md
+@@ -181,7 +181,7 @@ On macOS 27.3 (M3 Max) the game stops at start-up with `rosetta error: unexpecte
+ 
+ The reproducer from issue #1, extended with `vpmaskmovd`, shows the cause without game files. Under CrossOver Wine 26.3.0 with `ROSETTA_ADVERTISE_AVX=1`, SSE and AVX `vmovups` stores survive in every layout, and so does a masked store wholly inside a protected page. A masked store that starts in writable memory and ends in a protected page hangs Rosetta with the same error, both in a block guarded the way `victory-gpu/src/watch.rs` guards it and in `MEM_WRITE_WATCH` memory, which Wine emulates with page protection. Rosetta seems to have written the first lanes before the fault and cannot finish the instruction afterwards.
+ 
+-VIctory uses both kinds of protection to see which title GPU memory changed. Without them, host copies of title memory take it whole every time, as they already do for memory that is not the runtime's, which came to 55 to 115 GB per world frame (#50). Under Rosetta, which `victory_gpu::fault_tracking` detects as Wine on Darwin, tracking is off by default, because Rosetta on macOS 26.6 also stops on a plain 32-byte `vmovups` that crosses into a protected page (#1), and #144 hung on an M1 with both switches on. `VICTORY_FAULT_TRACKING=1` turns tracking on, and the stores Rosetta cannot resume are then patched at load time (below). `0` turns it off anywhere. `victory` prints `fault tracking on` or `off` at start-up, with the variable that turns it on when it is off under Rosetta.
++VIctory uses both kinds of protection to see which title GPU memory changed. Without them, host copies of title memory take it whole every time, as they already do for memory that is not the runtime's, which came to 55 to 115 GB per world frame (#50). Under Rosetta, which `victory_gpu::fault_tracking` detects as Wine on Darwin, tracking is otherwise off by default, because Rosetta on macOS 26.6 also stops on a plain 32-byte `vmovups` that crosses into a protected page (#1), and #144 hung on an M1 with both switches on. `VICTORY_FAULT_TRACKING=1` turns tracking on, and the stores Rosetta cannot resume are then patched at load time (below). `0` turns it off anywhere. For a known build whose plain 256-bit stores are listed (`victory-game`), as Series 1.0.2.1's are, `victory` turns tracking on itself: every store that can fault is patched, so it is safe, and refreshes then copy the pages the title wrote (about 0.3 MB a submission in the loading screens, against 174 MB whole). `victory` prints `fault tracking on` or `off` at start-up, with the variable that turns it on when it is off under Rosetta.
+ 
+ Which stores Rosetta resumes after a write fault was measured on macOS 27.0.1 (M5 Pro) with a native x86-64 test that stores against a no-access page, with the whole store inside it or starting before it, from code translated both ahead of time and at run time. Plain stores of every width (`mov`, `movups`, `vmovups`, `vmovdqu`, `vmovntdq`, `movnti`, `vmovq`, `vpextrq`, `vextractf128`), adjacent pairs of them, `rep stosb`, `rep movsq` and locked atomics all resume. Every AVX masked store (`vpmaskmovd`, `vpmaskmovq`, `vmaskmovps` and `vmaskmovpd`, at 128 and 256 bits) stops Rosetta when it starts before the page, and resumes when it is wholly inside it or its lanes in the page are masked off. `vcvtps2ph` to memory stops Rosetta even wholly inside the page. The store patch below rewrites exactly those.
+ 
+@@ -270,5 +270,6 @@ None of these changes the default. Each is read from the environment when the ga
+ | `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0: the title's own upscaler's render scale (2/3 by default, Series X). Not yet tested on a Mac. |
+ | `VICTORY_UPSCALER=<6\|7>` | Makes the title pick its own upscaler (6) or FidelityFX (7). Not yet tested on a Mac. |
+ | `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |
++| `VICTORY_ALIAS_BUFFERS=1` | Under Rosetta with D3DMetal, points title buffers at the pages of a D3DMetal buffer with `mach_vm_remap`, so they need no host copies (#204). A probe at start-up falls back to the copies if the remap does not work. It has only synthetic tests so far, so it needs a run in the game. |
+ | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |
+ | `VICTORY_WINDOW_SECONDARY=x,y` | Opens the game window on the display that holds the desktop point `x,y`, for layouts with more than one extra display (a Sidecar iPad beside two monitors, say). |

@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 17:19:40 -0500
+Subject: [PATCH 13/15] shader: VICTORY_WAVE64_REDUCE takes reductions in
+ IR-uniform control flow
+
+The 5 low-rate wave-reduction refusals (0a5d4f90, a53a7977, 1369868128,
+ce2378e5, be14e72d; 4/4/2/2/0 dispatches a frame, the post-process cadence)
+stop at 'a wave reduction over both 32-lane halves' because the reduction's
+block is not in in_step: the loop counts are not proven alike, though every
+branch on the path is on a scalar (uniform_control).
+
+With VICTORY_WAVE64_REDUCE=1, when the reduction is not inside a nested
+guard block (cur == level) and every path to its block goes through scalar
+branches only, the halves reduce their own 32 lanes and exchange the result
+through threadgroup memory with a group barrier (the existing
+reduce_across), instead of refusing. Lane branches still refuse: they split
+the wave, and a barrier there could hang. Off by default; part of the shader
+cache key.
+
+Host tests: uniform_control follows a scalar branch and rejects both sides
+of a lane (v_cmpx + s_cbranch_execz) branch. Build checked to target-b with
+DXC (indirect-clamp.dxil 5,244 B); target/ was not touched.
+---
+ crates/victory-gpu/src/shader_cache.rs        | 30 ++++++++------
+ crates/victory-shader/src/emit/lower.rs       | 20 +++++++++-
+ .../victory-shader/src/emit/lower/barriers.rs | 40 +++++++++++++++++++
+ crates/victory-shader/src/emit/lower/tests.rs | 20 ++++++++++
+ crates/victory-shader/src/emit/mod.rs         |  2 +-
+ 5 files changed, 98 insertions(+), 14 deletions(-)
+
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index d47436d..650c87c 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -73,6 +73,7 @@ fn build() -> &'static [u8; 32] {
+             victory_shader::emit::barrier_lds(),
+             victory_shader::emit::ps_sample_grad(),
+             victory_shader::emit::ps_lod_explicit(),
++            victory_shader::emit::wave64_reduce(),
+         )
+     })
+ }
+@@ -95,6 +96,7 @@ fn key(
+     barrier_lds: bool,
+     ps_sample_grad: bool,
+     ps_lod_explicit: bool,
++    wave64_reduce: bool,
+ ) -> [u8; 32] {
+     let mut h = blake3::Hasher::new();
+     h.update(translator.as_bytes());
+@@ -108,6 +110,7 @@ fn key(
+         u8::from(barrier_lds),
+         u8::from(ps_sample_grad),
+         u8::from(ps_lod_explicit),
++        u8::from(wave64_reduce),
+     ]);
+     *h.finalize().as_bytes()
+ }
+@@ -680,12 +683,12 @@ mod tests {
+     /// another key, so no entry written before it is read.
+     #[test]
+     fn the_key_covers_translator_encoding_and_settings() {
+-        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, false, false, false);
+-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false, false, false));
+-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, false, false, false));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, false, false, false));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, false, false, false));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, false, false, false));
++        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, false, false, false, false);
++        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false, false, false, false));
++        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, false, false, false, false));
++        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, false, false, false, false));
++        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, false, false, false, false));
++        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, false, false, false, false));
+         assert_eq!(
+             *build(),
+             key(
+@@ -695,7 +698,8 @@ mod tests {
+                 host_wave32(),
+                 victory_shader::emit::barrier_lds(),
+                 victory_shader::emit::ps_sample_grad(),
+-                victory_shader::emit::ps_lod_explicit()
++                victory_shader::emit::ps_lod_explicit(),
++                victory_shader::emit::wave64_reduce()
+             )
+         );
+         // The encoding part is this file as built.
+@@ -720,15 +724,17 @@ mod tests {
+ 
+     #[test]
+     fn diagnostic_emitter_switches_change_the_cache_key() {
+-        let base = key("t", b"e", 1, true, false, false, false);
+-        let barrier = key("t", b"e", 1, true, true, false, false);
+-        let sample = key("t", b"e", 1, true, false, true, false);
+-        let lod = key("t", b"e", 1, true, false, false, true);
++        let base = key("t", b"e", 1, true, false, false, false, false);
++        let barrier = key("t", b"e", 1, true, true, false, false, false);
++        let sample = key("t", b"e", 1, true, false, true, false, false);
++        let lod = key("t", b"e", 1, true, false, false, true, false);
++        let reduce = key("t", b"e", 1, true, false, false, false, true);
+         assert_ne!(base, barrier);
+         assert_ne!(base, sample);
+         assert_ne!(base, lod);
++        assert_ne!(base, reduce);
+         assert_ne!(barrier, sample);
+-        assert_eq!(base, key("t", b"e", 1, true, false, false, false));
++        assert_eq!(base, key("t", b"e", 1, true, false, false, false, false));
+     }
+ 
+     #[test]
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 6326dc9..0e6caf6 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -74,6 +74,16 @@ pub fn ps_lod_explicit() -> bool {
+     *ON.get_or_init(|| std::env::var("VICTORY_PS_LOD_EXPLICIT").as_deref() == Ok("1"))
+ }
+ 
++/// Whether `VICTORY_WAVE64_REDUCE=1` takes a wave reduction that sits in
++/// IR-uniform control flow (scalar branches only) even where [`in_step`]
++/// cannot prove the loop counts alike: the two halves reduce their own
++/// 32 lanes and exchange the result through threadgroup memory with a
++/// barrier. Part of the shader cache key.
++pub fn wave64_reduce() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("VICTORY_WAVE64_REDUCE").as_deref() == Ok("1"))
++}
++
+ #[derive(Debug, Clone, Copy)]
+ enum Val {
+     I32(V),
+@@ -1470,7 +1480,15 @@ impl<'a> Lower<'a> {
+         // only identities and the host wave holds the console wave's lanes in
+         // order. Otherwise the halves pass each other their results.
+         let across = self.halves && !self.one_host_wave();
+-        if across && !self.across_here() {
++        let forced = across
++            && !self.across_here()
++            && wave64_reduce()
++            && self.cur == self.level
++            && crate::emit::lower::barriers::uniform_control(self.x.p, self.x.st)
++                .get(self.cur_ir)
++                .copied()
++                .unwrap_or(false);
++        if across && !self.across_here() && !forced {
+             return Err(ACROSS);
+         }
+         let c = self.cur;
+diff --git a/crates/victory-shader/src/emit/lower/barriers.rs b/crates/victory-shader/src/emit/lower/barriers.rs
+index 3f1d76c..42f7d70 100644
+--- a/crates/victory-shader/src/emit/lower/barriers.rs
++++ b/crates/victory-shader/src/emit/lower/barriers.rs
+@@ -239,6 +239,46 @@ pub(crate) fn in_step(p: &Program, st: &Structured, lane_alike: &HashSet<Value>)
+     }
+ }
+ 
++/// Per block, whether every path from the entry to it goes through branches
++/// on scalars only ([`Atom::Uniform`]), at the IR level: no branch on a lane
++/// condition splits the console wave on the way. Unlike [`in_step`], the
++/// scalar values are not required to be provably alike, and loops on scalars
++/// do not block it (the caller decides when that is enough: a wave reduction
++/// whose loop count is the same for both host waves). A branch on a lane
++/// condition (or an indirect exit) makes both its sides not uniform.
++pub(crate) fn uniform_control(p: &Program, st: &Structured) -> Vec<bool> {
++    let n = st.exits.len().min(p.blocks.len());
++    let edge = |b: usize| match st.exits[b] {
++        LaneExit::Jump(_) | LaneExit::End => true,
++        LaneExit::Branch { when, .. } => st
++            .bools
++            .support(when)
++            .iter()
++            .all(|a| matches!(a, Atom::Uniform(_))),
++        LaneExit::Indirect => false,
++    };
++    // The greatest fixed point from `true`: a loop header stays true when its
++    // whole loop is on scalars, and a lane branch narrows both its sides.
++    let mut uniform = vec![true; n];
++    loop {
++        let mut changed = false;
++        for b in 0..n {
++            let next = b == 0
++                || {
++                    let preds = &p.blocks[b].preds;
++                    !preds.is_empty() && preds.iter().all(|&q| q < n && uniform[q] && edge(q))
++                };
++            if uniform[b] != next {
++                uniform[b] = next;
++                changed = true;
++            }
++        }
++        if !changed {
++            return uniform;
++        }
++    }
++}
++
+ /// Per block, whether each lane of the group runs it exactly once: no cycle
+ /// passes through it, and every path from the entry to an end does. A group
+ /// barrier needs every lane of the group, so it can go only in these.
+diff --git a/crates/victory-shader/src/emit/lower/tests.rs b/crates/victory-shader/src/emit/lower/tests.rs
+index 25695eb..fa9f8b3 100644
+--- a/crates/victory-shader/src/emit/lower/tests.rs
++++ b/crates/victory-shader/src/emit/lower/tests.rs
+@@ -2203,3 +2203,23 @@ fn the_lds_only_barrier_leaves_out_the_device_and_texture_fences() {
+     assert_eq!(super::barrier_mode(false, true), 1);
+     assert_eq!(super::barrier_mode(true, true), 1);
+ }
++
++#[test]
++fn uniform_control_follows_scalar_branches_but_not_lane_branches() {
++    let build = |words: &[u32]| {
++        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++        let p = ir::build(&code, false, 256).unwrap();
++        let st = structure::structure(&p).unwrap();
++        super::barriers::uniform_control(&p, &st)
++    };
++    // s_cmp_eq_u32 s1, 0; s_cbranch_scc1 past a move; s_mov_b32 s2, 1; s_endpgm
++    let scalar = build(&[
++        0xBF06_8001, 0xBF85_0001, 0xBE82_0381, S_ENDPGM,
++    ]);
++    assert!(scalar.iter().all(|&u| u), "{scalar:?}");
++    // v_cmpx_eq_u32 exec, 0, v0; s_cbranch_execz past a move; s_mov_b32 s2, 1; s_endpgm
++    let lane = build(&[
++        0x7DA4_0080, 0xBF88_0001, 0xBE82_0381, S_ENDPGM,
++    ]);
++    assert!(!lane[1] && !lane[2], "{lane:?}");
++}
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 4fc8e48..af77df7 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -260,7 +260,7 @@ mod deltas;
+ mod rect;
+ pub use container::sign as sign_container;
+ pub use deltas::{VERTEX_DELTA_TOP, VERTEX_DELTAS, needs_vertex_deltas, vertex_delta_gs};
+-pub use lower::{barrier_lds, ps_lod_explicit, ps_sample_grad};
++pub use lower::{barrier_lds, ps_lod_explicit, ps_sample_grad, wave64_reduce};
+ pub use rect::{rectangle_gs, right_angle};
+ #[cfg(all(test, windows))]
+ mod memory_tests;

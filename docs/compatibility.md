@@ -2,6 +2,19 @@
 
 Tested on an Apple M3 Max with CrossOver Preview 27.0.0.41073 and D3DMetal 4.0b3.
 
+## November 26 and 27 native window tests
+
+These Series S tests used a local development build of ScarlettMac with four shader fixes, desktop AMD FSR 3.1.6, and a 720p game output profile.
+
+| Test | Observed result |
+| --- | --- |
+| Prologue pipeline cache | The first scene frame recorded 6,829 draws with the prepared pipeline cache and 503 in the cold run. The warmed run showed the prison yard, watchtower, and people in silhouette. |
+| Prologue display layers | Fenced samples from the 720p layer contained color while the 4K layer was black at the sampled points. Selecting the 720p layer as the base picture made the fence and figures clearer in the opening shot. Later frames still washed out before the memory guard stopped the run. |
+| Prologue movement tutorial | A Series S replay with the 720p layer as the base reached the prison yard and displayed both movement prompts. After the prompts, the game read opposite right-stick directions, forward left-stick input, and neutral releases. The native window remained overexposed and ran at about 0.7 fps during the test. The images did not establish visible movement from those inputs. The run ended at its 850-second time limit. |
+| Gone Fishing save replay | A run with the FSR sampling trace disabled read the save and recorded 22,564 draws on its first heavy 3D frame. The saved frame was almost white. The memory guard stopped the run after 127.4 seconds, before the movement check could start. |
+
+Two earlier runs with the FSR sampling trace enabled read the same Gone Fishing save and stayed on loading artwork. One run reaching the scene with the trace disabled does not establish the cause of the loading stalls. Gameplay remains unavailable.
+
 ## Prologue rendering breakthroughs
 
 On November 26, 2026, experimental runtimes on an Apple M3 Max with CrossOver and D3DMetal captured these scenes in the final game image.

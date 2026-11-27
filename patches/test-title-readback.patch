@@ -1,0 +1,13 @@
+diff --git a/tests/testtitle/src/gpu.rs b/tests/testtitle/src/gpu.rs
+index d84d465..39b7ea8 100644
+--- a/tests/testtitle/src/gpu.rs
++++ b/tests/testtitle/src/gpu.rs
+@@ -1064,6 +1064,8 @@ pub fn render_triangle() -> Result<(), String> {
+         end(l, q, occ, 1);
+         end(l, q, occ, 0);
+         xslot::<Resolve>(&list, 30)(l, q, occ, 0, 3, results.as_raw(), 0);
++        type KickoffX = unsafe extern "system" fn(*mut c_void);
++        xslot::<KickoffX>(&list, 93)(l);
+         let barrier = D3D12_RESOURCE_BARRIER {
+             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

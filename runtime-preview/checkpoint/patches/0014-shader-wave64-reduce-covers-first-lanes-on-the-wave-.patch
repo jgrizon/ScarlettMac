@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 17:41:44 -0500
+Subject: [PATCH 14/15] shader: wave64 reduce covers first lanes on the
+ wave-path assumption
+
+The five low-rate reductions still refused after the strict uniform_control
+gate: their reduction blocks are behind lane branches, which uniform_control
+rejects. A lane branch does not split the two host waves (both execute both
+sides, masked); only a scalar branch can, and VICTORY_WAVE64_REDUCE already
+assumes both halves compute the same scalars. wave_path therefore treats
+every branch/jump edge as traversable and only an indirect exit as unsafe;
+the reduction gate and a first-lane read on the same path use it.
+
+Offline check with the containers the last run spilled (0a5d4f90,
+a53a7977, 1369868128, ce2378e5, be14e72d): all five now translate
+(182796, 493668, 46136, 31684, 455288 byte DXIL). Test: a lane branch is
+wave_path-uniform but not uniform_control-uniform. Host tests pass.
+---
+ crates/victory-shader/src/emit/lower.rs       | 33 ++++++++++++++++---
+ .../victory-shader/src/emit/lower/barriers.rs | 30 +++++++++++++++++
+ crates/victory-shader/src/emit/lower/tests.rs | 15 +++++++++
+ 3 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 0e6caf6..ac93e2f 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -1480,15 +1480,29 @@ impl<'a> Lower<'a> {
+         // only identities and the host wave holds the console wave's lanes in
+         // order. Otherwise the halves pass each other their results.
+         let across = self.halves && !self.one_host_wave();
++        // The halves' exchange needs both waves to reach the barriers. A
++        // lane branch does not split them (both execute both sides); only a
++        // scalar branch could, and the switch assumes both halves compute
++        // the same scalars (wave_path; uniform_control is the strict form).
++        let wave = crate::emit::lower::barriers::wave_path(self.x.p, self.x.st)
++            .get(self.cur_ir)
++            .copied()
++            .unwrap_or(false);
+         let forced = across
+             && !self.across_here()
+             && wave64_reduce()
+             && self.cur == self.level
+-            && crate::emit::lower::barriers::uniform_control(self.x.p, self.x.st)
+-                .get(self.cur_ir)
+-                .copied()
+-                .unwrap_or(false);
++            && wave;
+         if across && !self.across_here() && !forced {
++            if wave64_reduce() && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
++                eprintln!(
++                    "REDUCE-REFUSED block={} cur-is-level={} wave_path={} step={}",
++                    self.cur_ir,
++                    self.cur == self.level,
++                    wave,
++                    self.step.get(self.cur_ir).copied().unwrap_or(false)
++                );
++            }
+             return Err(ACROSS);
+         }
+         let c = self.cur;
+@@ -7449,7 +7463,16 @@ impl<'a> Lower<'a> {
+                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                         if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
+                 {
+-                    if !self.across_here() {
++                    // The reduction switch's assumption (both waves follow
++                    // the same wave-level flow) covers a first lane too: the
++                    // exchange's barriers are reached by both halves.
++                    let wave = wave64_reduce()
++                        && self.cur == self.level
++                        && crate::emit::lower::barriers::wave_path(self.x.p, self.x.st)
++                            .get(self.cur_ir)
++                            .copied()
++                            .unwrap_or(false);
++                    if !self.across_here() && !wave {
+                         if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                             let from = v.src.first().and_then(|op| match *op {
+                                 Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+diff --git a/crates/victory-shader/src/emit/lower/barriers.rs b/crates/victory-shader/src/emit/lower/barriers.rs
+index 42f7d70..a0b298f 100644
+--- a/crates/victory-shader/src/emit/lower/barriers.rs
++++ b/crates/victory-shader/src/emit/lower/barriers.rs
+@@ -279,6 +279,36 @@ pub(crate) fn uniform_control(p: &Program, st: &Structured) -> Vec<bool> {
+     }
+ }
+ 
++/// Per block, whether the wave-level control flow to it is the same for both
++/// host waves: every edge is a branch (lane or scalar) or a jump, no indirect
++/// exit. A branch on a lane condition does not split the waves (both execute
++/// both sides, masked); a scalar branch splits them only if the two waves
++/// compute different scalars, which this assumes they do not
++/// (`VICTORY_WAVE64_REDUCE`). For placing the halves' exchange barrier in a
++/// wave reduction, where [`uniform_control`] is stricter than needed.
++pub(crate) fn wave_path(p: &Program, st: &Structured) -> Vec<bool> {
++    let n = st.exits.len().min(p.blocks.len());
++    let edge = |b: usize| !matches!(st.exits[b], LaneExit::Indirect);
++    let mut same = vec![true; n];
++    loop {
++        let mut changed = false;
++        for b in 0..n {
++            let next = b == 0
++                || {
++                    let preds = &p.blocks[b].preds;
++                    !preds.is_empty() && preds.iter().all(|&q| q < n && same[q] && edge(q))
++                };
++            if same[b] != next {
++                same[b] = next;
++                changed = true;
++            }
++        }
++        if !changed {
++            return same;
++        }
++    }
++}
++
+ /// Per block, whether each lane of the group runs it exactly once: no cycle
+ /// passes through it, and every path from the entry to an end does. A group
+ /// barrier needs every lane of the group, so it can go only in these.
+diff --git a/crates/victory-shader/src/emit/lower/tests.rs b/crates/victory-shader/src/emit/lower/tests.rs
+index fa9f8b3..757f39d 100644
+--- a/crates/victory-shader/src/emit/lower/tests.rs
++++ b/crates/victory-shader/src/emit/lower/tests.rs
+@@ -2223,3 +2223,18 @@ fn uniform_control_follows_scalar_branches_but_not_lane_branches() {
+     ]);
+     assert!(!lane[1] && !lane[2], "{lane:?}");
+ }
++
++#[test]
++fn wave_path_follows_lane_branches_where_uniform_control_does_not() {
++    // v_cmpx_eq_u32 exec, 0, v0; s_cbranch_execz past a move; s_mov s2, 1; s_endpgm
++    let words = [0x7DA4_0080, 0xBF88_0001, 0xBE82_0381, S_ENDPGM];
++    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++    let p = ir::build(&code, false, 256).unwrap();
++    let st = structure::structure(&p).unwrap();
++    // Both waves execute both sides of a lane branch: the path is the same.
++    let path = super::barriers::wave_path(&p, &st);
++    assert!(path.iter().all(|&u| u), "{path:?}");
++    // The strict form still refuses to call it uniform.
++    let strict = super::barriers::uniform_control(&p, &st);
++    assert!(!strict[1] && !strict[2], "{strict:?}");
++}

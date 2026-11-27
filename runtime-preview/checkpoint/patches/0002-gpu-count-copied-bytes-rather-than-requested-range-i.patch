@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 15:55:50 -0500
+Subject: [PATCH 02/15] gpu: count copied bytes rather than requested range in
+ parallel refresh summary
+
+---
+ crates/victory-gpu/src/host.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 3655305..f9d4ecb 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -3601,7 +3601,7 @@ impl Batch {
+                     {
+                         counted.range(from, to - from, us, 0);
+                         self.summary
+-                            .record(from as u64, (to - from) as u64, shadow.gpu(from as u64));
++                            .record(from as u64, copied as u64, shadow.gpu(from as u64));
+                     }
+                     PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);

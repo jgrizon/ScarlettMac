@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 18:05:33 -0500
+Subject: [PATCH 15/15] shader: wave64 lane reads cross halves on the wave-path
+ assumption
+
+The last 2 'a lane read that may cross 32-lane halves' refusals are
+v_readlane_b32 in a block wave_path says both host waves reach; with
+VICTORY_WAVE64_REDUCE=1 the read now uses read_lane_across (the halves'
+own first lanes exchanged through threadgroup memory) instead of
+refusing. Same gate as the reduction and first-lane paths. Host tests
+pass.
+---
+ crates/victory-shader/src/emit/lower.rs | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index ac93e2f..7be5111 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -7373,7 +7373,17 @@ impl<'a> Lower<'a> {
+                     self.cross_lane(false)?;
+                 }
+                 if self.halves && !self.one_host_wave() {
+-                    if !self.across_here() {
++                    // Under the reduction switch's wave-path assumption both
++                    // halves reach the exchange's barriers: a lane read can
++                    // cross (read_lane_across exchanges the halves' first
++                    // lanes).
++                    let wave = wave64_reduce()
++                        && self.cur == self.level
++                        && crate::emit::lower::barriers::wave_path(self.x.p, self.x.st)
++                            .get(self.cur_ir)
++                            .copied()
++                            .unwrap_or(false);
++                    if !self.across_here() && !wave {
+                         return Err(
+                             "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
+                         );

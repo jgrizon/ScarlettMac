@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 16:32:06 -0500
+Subject: [PATCH 11/15] shader: lane-alike branches run together; scalar inputs
+ are per wave
+
+VICTORY_WAVE_WHY=1 on ds-past3 showed the remaining first-lane refusals:
+34 shaders, all a v_readfirstlane_b32 in a block in_step called not
+together, whose value comes from v_cvt_u32_f32/v_floor_f32/v_mul_legacy/
+buffer_load_format_x/v_cndmask_b32 or a program input. Those are loop
+counts and indices computed by vector float math that is one value per
+console wave.
+
+in_step now treats a branch on a lane condition in
+halves::lane_uniform as running together, like a scalar one, and
+lane_uniform seeds the scalar inputs (user data, system values; not EXEC
+or VCC) as one value per wave. That lets across_here/exchange_halves take
+those first lanes exactly instead of refusing them, and lets barrier
+placement see the loops as in step. lane_uniform is computed once and
+shared by the barrier and halves paths.
+
+Host cargo test -p victory-shader: 213 pass.
+---
+ crates/victory-shader/src/emit/lower.rs       | 20 ++++++++------
+ .../victory-shader/src/emit/lower/barriers.rs | 26 ++++++++++++-------
+ .../victory-shader/src/emit/lower/halves.rs   |  9 ++++++-
+ crates/victory-shader/src/emit/lower/tests.rs |  2 +-
+ 4 files changed, 38 insertions(+), 19 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 5249902..7f0e74d 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -733,6 +733,7 @@ impl<'a> Lower<'a> {
+         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
+             || insts().any(|i| i.name().starts_with("image_bvh"));
+         let mut console_lanes = false;
++        let mut lane_alike: HashSet<Value> = HashSet::new();
+         let (mut halves, mut halves_refused) = (false, None);
+         let mut split_barriers = Set::default();
+         if let StageIo::Cs(cs) = x.native.io {
+@@ -779,6 +780,13 @@ impl<'a> Lower<'a> {
+             let wave = if x.native.wave64 { 64 } else { 32 };
+             let group = cs.threads.iter().product::<u32>();
+             let one_wave = group <= wave;
++            // Values one per console wave, for the barrier placement and the
++            // halves' first-lane/lane reads: a branch on one runs together.
++            lane_alike = if x.native.wave64 && x.host_wave32 {
++                halves::lane_uniform(x)
++            } else {
++                HashSet::new()
++            };
+             // The console's one wave is several host waves: LDS no longer
+             // passes between its lanes without a barrier.
+             let mut synced = false;
+@@ -786,14 +794,14 @@ impl<'a> Lower<'a> {
+                 // shortcut: a read in divergent code of what divergent code
+                 // wrote gets no barrier (none could be placed there); the
+                 // program then runs as before.
+-                if let Some(b) = split_wave_barriers(p, x.st) {
++                if let Some(b) = split_wave_barriers(p, x.st, &lane_alike) {
+                     split_barriers = b;
+                     synced = true;
+                 } else if let Some(flags) = halves::lds_flag_blocks(x) {
+                     // The divergent regions that cannot take a barrier only
+                     // raise an LDS flag: a read that misses the other half's
+                     // write changes nothing they leave behind.
+-                    if let Some(b) = split_wave_barriers_allowing(p, x.st, &flags) {
++                    if let Some(b) = split_wave_barriers_allowing(p, x.st, &flags, &lane_alike) {
+                         split_barriers = b;
+                         synced = true;
+                     }
+@@ -921,14 +929,10 @@ impl<'a> Lower<'a> {
+             halves,
+             halves_refused,
+             relabelled: None,
+-            step: if halves { in_step(p, x.st) } else { Vec::new() },
++            step: if halves { in_step(p, x.st, &lane_alike) } else { Vec::new() },
+             half_words: None,
+             level: 0,
+-            alike: if halves {
+-                halves::lane_uniform(x)
+-            } else {
+-                HashSet::new()
+-            },
++            alike: if halves { lane_alike } else { HashSet::new() },
+             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
+                 if db_shader_control & 1 << 16 != 0),
+             root_memory,
+diff --git a/crates/victory-shader/src/emit/lower/barriers.rs b/crates/victory-shader/src/emit/lower/barriers.rs
+index 2066167..3f1d76c 100644
+--- a/crates/victory-shader/src/emit/lower/barriers.rs
++++ b/crates/victory-shader/src/emit/lower/barriers.rs
+@@ -25,8 +25,12 @@ use super::*;
+ /// `None`: a read in divergent code may see a write made in divergent code
+ /// since the last barrier. A write in divergent code after a read there gets
+ /// no barrier, as before.
+-pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(usize, usize)>> {
+-    split_wave_barriers_allowing(p, st, &HashSet::new())
++pub(crate) fn split_wave_barriers(
++    p: &Program,
++    st: &Structured,
++    lane_alike: &HashSet<Value>,
++) -> Option<Set<(usize, usize)>> {
++    split_wave_barriers_allowing(p, st, &HashSet::new(), lane_alike)
+ }
+ 
+ /// [`split_wave_barriers`], and with `flags` the blocks of LDS flag regions
+@@ -37,6 +41,7 @@ pub(crate) fn split_wave_barriers_allowing(
+     p: &Program,
+     st: &Structured,
+     flags: &HashSet<usize>,
++    lane_alike: &HashSet<Value>,
+ ) -> Option<Set<(usize, usize)>> {
+     /// LDS accesses since the last barrier.
+     #[derive(Clone, Copy, Default, PartialEq)]
+@@ -68,7 +73,7 @@ pub(crate) fn split_wave_barriers_allowing(
+     };
+     let n = p.blocks.len();
+     let succ = |b: usize| p.blocks[b].exit.successors();
+-    let step = in_step(p, st);
++    let step = in_step(p, st, lane_alike);
+     let divergent_writes = (0..n).any(|b| {
+         !step[b]
+             && p.blocks[b]
+@@ -142,7 +147,7 @@ pub(crate) fn split_wave_barriers_allowing(
+ /// Scalars are assumed alike until shown otherwise (a loop counter needs
+ /// itself), and the regions and the scalars are narrowed together to a
+ /// fixed point. With an indirect branch, the blocks each lane runs once.
+-pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
++pub(crate) fn in_step(p: &Program, st: &Structured, lane_alike: &HashSet<Value>) -> Vec<bool> {
+     let Some(regions) = halves::branch_regions(st) else {
+         return once_per_lane(p);
+     };
+@@ -189,11 +194,14 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
+             let LaneExit::Branch { when, .. } = st.exits[*d] else {
+                 continue;
+             };
+-            let together = st
+-                .bools
+-                .support(when)
+-                .iter()
+-                .all(|a| matches!(a, Atom::Uniform(v) if alike.contains(v)));
++            let together = st.bools.support(when).iter().all(|a| match *a {
++                Atom::Uniform(v) => alike.contains(&v),
++                // A lane condition the console wave holds alike splits the
++                // two host waves no more than a scalar one: the value is one
++                // per console wave (`halves::lane_uniform`).
++                Atom::Lane(v) => lane_alike.contains(&v),
++                _ => false,
++            });
+             if !together {
+                 for (b, &r) in region.iter().enumerate() {
+                     step[b] &= !r;
+diff --git a/crates/victory-shader/src/emit/lower/halves.rs b/crates/victory-shader/src/emit/lower/halves.rs
+index dedfe5f..342d797 100644
+--- a/crates/victory-shader/src/emit/lower/halves.rs
++++ b/crates/victory-shader/src/emit/lower/halves.rs
+@@ -782,7 +782,14 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
+     let regions = branch_regions(st);
+     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
+-    let mut same: HashSet<Value> = HashSet::new();
++    // Scalar inputs (user data, system values) are one value per wave. EXEC
++    // and VCC are not: each host wave has its own.
++    let mut same: HashSet<Value> = p
++        .inputs
++        .iter()
++        .filter(|(r, _)| matches!(r, Reg::S(c) if *c != EXEC && *c != EXEC + 1 && *c != VCC && *c != VCC + 1))
++        .map(|(_, v)| *v)
++        .collect();
+     loop {
+         let alike_atom = |same: &HashSet<Value>, a: &Atom| match *a {
+             Atom::Uniform(_) => true,
+diff --git a/crates/victory-shader/src/emit/lower/tests.rs b/crates/victory-shader/src/emit/lower/tests.rs
+index baf6110..25695eb 100644
+--- a/crates/victory-shader/src/emit/lower/tests.rs
++++ b/crates/victory-shader/src/emit/lower/tests.rs
+@@ -1345,7 +1345,7 @@ fn wave64(words: &[u32]) -> ir::Program {
+ /// [`super::split_wave_barriers`] of a program.
+ fn barriers_at(p: &ir::Program) -> Option<Vec<(usize, usize)>> {
+     let st = structure::structure(p).unwrap();
+-    let mut at: Vec<_> = super::split_wave_barriers(p, &st)?.into_iter().collect();
++    let mut at: Vec<_> = super::split_wave_barriers(p, &st, &Default::default())?.into_iter().collect();
+     at.sort_unstable();
+     Some(at)
+ }

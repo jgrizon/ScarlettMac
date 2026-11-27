@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 16:14:42 -0500
+Subject: [PATCH 08/15] shader: VICTORY_BARRIER_LDS leaves group barriers
+ TGSM-only
+
+D3DMetal on AGX M1 fails to create the compute pipeline that uses the
+fence our dx.op.barrier modes become: 'Encountered unlowered function call
+to air.fence_' (pipeline 1e99b7e849e2882f; the same in the no-port up720
+run). A console s_barrier orders group-shared memory, not global memory by
+itself (the title's waits do that), so the device (2) and texture (8) bits
+are not needed for it. With VICTORY_BARRIER_LDS=1 both the s_barrier path
+and the halves exchange barrier emit mode 1 instead of 1|8 / 1|2|8;
+default emission is unchanged.
+
+Host test covers all four mode combinations.
+---
+ crates/victory-shader/src/emit/lower.rs       | 23 ++++++++++++++++++-
+ .../victory-shader/src/emit/lower/halves.rs   |  2 +-
+ crates/victory-shader/src/emit/lower/tests.rs | 10 ++++++++
+ 3 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index c486b34..87a266f 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -31,6 +31,27 @@ use mesh::prune_signature;
+ 
+ type Why = &'static str;
+ 
++/// `dx.op.barrier` mode for a console group barrier: TGSM (1), plus the UAV
++/// (2) and texture (8) bits the host may need. `VICTORY_BARRIER_LDS=1`
++/// leaves TGSM only: D3DMetal on AGX M1 fails to lower the fence these
++/// become (`air.fence_`), and a console `s_barrier` orders group-shared
++/// memory, not global memory by itself (the title's waits do that).
++fn barrier_mode(writes_uavs: bool, lds_only: bool) -> u32 {
++    if lds_only {
++        1
++    } else if writes_uavs {
++        1 | 2 | 8
++    } else {
++        1 | 8
++    }
++}
++
++/// Whether `VICTORY_BARRIER_LDS=1` leaves barriers TGSM-only (diagnostic for
++/// the AGX `air.fence_` pipeline creation failure).
++fn barrier_lds_only() -> bool {
++    std::env::var("VICTORY_BARRIER_LDS").as_deref() == Ok("1")
++}
++
+ #[derive(Debug, Clone, Copy)]
+ enum Val {
+     I32(V),
+@@ -3917,7 +3938,7 @@ impl<'a> Lower<'a> {
+     /// the program writes UAVs (the waits before an s_barrier make those
+     /// writes visible on the console).
+     fn group_barrier(&mut self) {
+-        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
++        let mode = barrier_mode(self.writes_uavs, barrier_lds_only());
+         let mode = self.s.m.i32(mode);
+         let void = self.s.t.void;
+         self.s
+diff --git a/crates/victory-shader/src/emit/lower/halves.rs b/crates/victory-shader/src/emit/lower/halves.rs
+index b72faf0..f7e0f16 100644
+--- a/crates/victory-shader/src/emit/lower/halves.rs
++++ b/crates/victory-shader/src/emit/lower/halves.rs
+@@ -225,7 +225,7 @@ impl Lower<'_> {
+         let high = self.s.m.bin(at, Bin::Or, slot, one);
+         let sync = |l: &mut Self| {
+             // Group sync with a group-shared memory fence.
+-            let mode = l.s.m.i32(1 | 8);
++            let mode = l.s.m.i32(barrier_mode(false, barrier_lds_only()));
+             let void = l.s.t.void;
+             l.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+         };
+diff --git a/crates/victory-shader/src/emit/lower/tests.rs b/crates/victory-shader/src/emit/lower/tests.rs
+index ee935b7..baf6110 100644
+--- a/crates/victory-shader/src/emit/lower/tests.rs
++++ b/crates/victory-shader/src/emit/lower/tests.rs
+@@ -2193,3 +2193,13 @@ fn a_lane_dependent_prefix_cannot_take_its_own_first_lane() {
+     );
+ }
+ 
++
++#[test]
++fn the_lds_only_barrier_leaves_out_the_device_and_texture_fences() {
++    // D3DMetal on AGX M1 fails to lower the fence the device/texture bits
++    // become (`air.fence_`), so VICTORY_BARRIER_LDS=1 keeps TGSM only.
++    assert_eq!(super::barrier_mode(false, false), 1 | 8);
++    assert_eq!(super::barrier_mode(true, false), 1 | 2 | 8);
++    assert_eq!(super::barrier_mode(false, true), 1);
++    assert_eq!(super::barrier_mode(true, true), 1);
++}

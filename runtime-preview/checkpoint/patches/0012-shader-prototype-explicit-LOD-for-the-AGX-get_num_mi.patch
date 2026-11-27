@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 16:39:06 -0500
+Subject: [PATCH 12/15] shader: prototype explicit LOD for the AGX
+ get_num_mip_levels failure
+
+D3DMetal on AGX M1 fails one mesh pipeline with 'Encountered unlowered
+function call to air.get_num_mip_levels_' (mesh 4ee6e34d + pixel a0f0a3c9).
+Its calculateLod lowering asks the texture for its mip count. With
+VICTORY_PS_LOD_EXPLICIT=1 a 2D pixel shader's image_get_lod computes the
+level itself: 0.5 log2 of the longer coarse-derivative length in level-0
+texels, from getDimensions(h, 0), clamped to 0..15. The two result
+channels keep their meaning (clamped, unclamped). Cubes, 3D, a16 and other
+stages keep calculateLod. Off by default; the switch is part of the shader
+cache key. Host tests pass.
+
+Whether this is the op behind the AGX error still needs the failing
+container (VICTORY_SPILL_ONLY) to confirm; it is the lower-risk half of
+the getDimensions/calculateLod pair.
+---
+ crates/victory-gpu/src/shader_cache.rs  | 33 +++++++++------
+ crates/victory-shader/src/emit/lower.rs | 56 +++++++++++++++++++++++++
+ crates/victory-shader/src/emit/mod.rs   |  2 +-
+ 3 files changed, 78 insertions(+), 13 deletions(-)
+
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index 38f1808..d47436d 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -72,6 +72,7 @@ fn build() -> &'static [u8; 32] {
+             host_wave32(),
+             victory_shader::emit::barrier_lds(),
+             victory_shader::emit::ps_sample_grad(),
++            victory_shader::emit::ps_lod_explicit(),
+         )
+     })
+ }
+@@ -93,6 +94,7 @@ fn key(
+     wave32: bool,
+     barrier_lds: bool,
+     ps_sample_grad: bool,
++    ps_lod_explicit: bool,
+ ) -> [u8; 32] {
+     let mut h = blake3::Hasher::new();
+     h.update(translator.as_bytes());
+@@ -102,7 +104,11 @@ fn key(
+     // Diagnostic emitter switches that change the DXIL (VICTORY_BARRIER_LDS,
+     // VICTORY_PS_SAMPLE_GRAD): a cached translation from the other setting
+     // must not be served.
+-    h.update(&[u8::from(barrier_lds), u8::from(ps_sample_grad)]);
++    h.update(&[
++        u8::from(barrier_lds),
++        u8::from(ps_sample_grad),
++        u8::from(ps_lod_explicit),
++    ]);
+     *h.finalize().as_bytes()
+ }
+ 
+@@ -674,12 +680,12 @@ mod tests {
+     /// another key, so no entry written before it is read.
+     #[test]
+     fn the_key_covers_translator_encoding_and_settings() {
+-        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, false, false);
+-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false, false));
+-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, false, false));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, false, false));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, false, false));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, false, false));
++        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, false, false, false);
++        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false, false, false));
++        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, false, false, false));
++        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, false, false, false));
++        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, false, false, false));
++        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, false, false, false));
+         assert_eq!(
+             *build(),
+             key(
+@@ -688,7 +694,8 @@ mod tests {
+                 victory_shader::emit::loop_limit(),
+                 host_wave32(),
+                 victory_shader::emit::barrier_lds(),
+-                victory_shader::emit::ps_sample_grad()
++                victory_shader::emit::ps_sample_grad(),
++                victory_shader::emit::ps_lod_explicit()
+             )
+         );
+         // The encoding part is this file as built.
+@@ -713,13 +720,15 @@ mod tests {
+ 
+     #[test]
+     fn diagnostic_emitter_switches_change_the_cache_key() {
+-        let base = key("t", b"e", 1, true, false, false);
+-        let barrier = key("t", b"e", 1, true, true, false);
+-        let sample = key("t", b"e", 1, true, false, true);
++        let base = key("t", b"e", 1, true, false, false, false);
++        let barrier = key("t", b"e", 1, true, true, false, false);
++        let sample = key("t", b"e", 1, true, false, true, false);
++        let lod = key("t", b"e", 1, true, false, false, true);
+         assert_ne!(base, barrier);
+         assert_ne!(base, sample);
++        assert_ne!(base, lod);
+         assert_ne!(barrier, sample);
+-        assert_eq!(base, key("t", b"e", 1, true, false, false));
++        assert_eq!(base, key("t", b"e", 1, true, false, false, false));
+     }
+ 
+     #[test]
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 7f0e74d..6326dc9 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -64,6 +64,16 @@ pub fn ps_sample_grad() -> bool {
+     *ON.get_or_init(|| std::env::var("VICTORY_PS_SAMPLE_GRAD").as_deref() == Ok("1"))
+ }
+ 
++/// Whether `VICTORY_PS_LOD_EXPLICIT=1` computes a 2D `image_get_lod`'s level
++/// of detail from coarse derivatives and the level-0 size instead of
++/// `dx.op.calculateLod`: D3DMetal on AGX M1 fails a mesh/PS pipeline with
++/// `air.get_num_mip_levels_`, which its calculateLod lowering needs. Part of
++/// the shader cache key.
++pub fn ps_lod_explicit() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("VICTORY_PS_LOD_EXPLICIT").as_deref() == Ok("1"))
++}
++
+ #[derive(Debug, Clone, Copy)]
+ enum Val {
+     I32(V),
+@@ -9669,6 +9679,52 @@ impl<'a> Lower<'a> {
+                     return Err("an image result");
+                 };
+                 let f32t = self.s.t.f32;
++                if ps_lod_explicit() && self.x.native.stage == HwStage::Ps && kind == 2 && !*a16
++                {
++                    // D3DMetal's calculateLod lowering asks the texture for
++                    // its mip count (`air.get_num_mip_levels_`), which AGX
++                    // M1 refuses in some mesh/PS pipelines. Compute the
++                    // isotropic level instead: 0.5 log2 of the longer
++                    // coarse-derivative length in level-0 texels.
++                    let i32t = self.s.t.i32;
++                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
++                    let zero = self.s.m.i32(0);
++                    let d = self
++                        .s
++                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, zero]);
++                    let size = |l: &mut Self, ch: u32| {
++                        let n = l.s.m.extract(c, d, ch);
++                        l.s.m.cast(c, Cast::UiToFp, n, f32t)
++                    };
++                    let (w, ht) = (size(self, 0), size(self, 1));
++                    let mut len2 = [self.s.m.f32(0); 2];
++                    for (k, l) in len2.iter_mut().enumerate() {
++                        let g = self.s.op(
++                            c,
++                            "derivCoarse.f32",
++                            Attr::ReadNone,
++                            f32t,
++                            83,
++                            &[cs[k]],
++                        );
++                        let g = self.s.m.bin(c, Bin::Mul, g, [w, ht][k]);
++                        *l = self.s.m.bin(c, Bin::Mul, g, g);
++                    }
++                    let m = self.binary(35, len2[0], len2[1]);
++                    let l = self.unary(23, m);
++                    let half = self.s.m.f32(0.5f32.to_bits());
++                    let lod = self.s.m.bin(c, Bin::Mul, l, half);
++                    let zero = self.s.m.f32(0);
++                    let max = self.s.m.f32(15.0f32.to_bits());
++                    let clamped = self.binary(35, lod, zero);
++                    let clamped = self.binary(36, clamped, max);
++                    for ch in (0..2u32).filter(|ch| dmask >> ch & 1 != 0) {
++                        let x = if ch == 0 { clamped } else { lod };
++                        let x = self.as_int(x);
++                        self.write(inst, Reg::V(reg + ch as u8), x, guard);
++                    }
++                    return Ok(());
++                }
+                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                     let clamped = self.s.m.bool(ch == 0);
+                     let lod = self.s.op(
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 6a76f2f..4fc8e48 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -260,7 +260,7 @@ mod deltas;
+ mod rect;
+ pub use container::sign as sign_container;
+ pub use deltas::{VERTEX_DELTA_TOP, VERTEX_DELTAS, needs_vertex_deltas, vertex_delta_gs};
+-pub use lower::{barrier_lds, ps_sample_grad};
++pub use lower::{barrier_lds, ps_lod_explicit, ps_sample_grad};
+ pub use rect::{rectangle_gs, right_angle};
+ #[cfg(all(test, windows))]
+ mod memory_tests;

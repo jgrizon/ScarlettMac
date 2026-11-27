@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 15:59:49 -0500
+Subject: [PATCH 06/15] test(shader): keep Belobug PR #142's BVH prefix cases
+
+Upstream already translates both forms (its read_lane_across/first_lane
+handling from #360 and the per-operand lane-uniform checks supersede the
+Belobug change), so no code is ported: the two tests are kept as
+regression coverage, adapted to our harness. The wave-alike prefix scan
+lowers with WaveSize(32); the lane-dependent-address form is refused with
+'a first-lane read of a value that may differ between 32-lane halves'.
+---
+ crates/victory-shader/src/emit/lower/tests.rs | 136 ++++++++++++++++++
+ 1 file changed, 136 insertions(+)
+
+diff --git a/crates/victory-shader/src/emit/lower/tests.rs b/crates/victory-shader/src/emit/lower/tests.rs
+index 031bcaa..ee935b7 100644
+--- a/crates/victory-shader/src/emit/lower/tests.rs
++++ b/crates/victory-shader/src/emit/lower/tests.rs
+@@ -2057,3 +2057,139 @@ fn a_branch_that_writes_lds_two_different_values_keeps_64_lanes() {
+     );
+ }
+ 
++
++// ---- BVH prefix scans (Belobug PR #142) ----
++
++/// The prefix of wave totals the console's structure builder computes: each
++/// console wave of a 256-thread group writes its total (10 + its index) to
++/// LDS, then, under `if (id >> 6 != 0)`, loops over the totals of the waves
++/// before it with lanes leaving at their own wave's index, reading the
++/// running sum's first lane (`v_readfirstlane`) every iteration. The total
++/// is read from the wave's last lane first (a read across the two host
++/// waves, which makes them exchange). The condition and the sum are the same
++/// in every lane of a console wave, so each host wave takes its own first
++/// lane. Every thread stores the sum of the waves before its own: 0, 10,
++/// 10 + 11, 10 + 11 + 12.
++fn wave_prefix_program(lane_dependent: bool) -> Vec<u32> {
++    let lds_address = if lane_dependent {
++        0x3410_0082 // v_lshlrev_b32 v8, 2, v0
++    } else {
++        0x7E10_0210 // v_mov_b32 v8, s16
++    };
++    let words = [
++        FLAG_PROLOGUE[0],
++        FLAG_PROLOGUE[1],
++        FLAG_PROLOGUE[2],
++        FLAG_PROLOGUE[3],
++        FLAG_PROLOGUE[4],
++        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0             (the console wave's index)
++        0x3410_0E82, // v_lshlrev_b32 v8, 2, v7
++        0x4A12_0E8A, // v_add_nc_u32 v9, 10, v7
++        0xD760_0013,
++        0x0201_7F09, // v_readlane_b32 s19, v9, 63   (the wave's last lane: the other host wave)
++        0x7E12_0213, // v_mov_b32 v9, s19
++        0xD834_0000,
++        0x0000_0908, // ds_write_b32 v8, v9
++        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
++        0xBF8A_0000, // s_barrier
++        0x7E10_0280, // v_mov_b32 v8, 0
++        0xBE80_047E, // s_mov_b64 s[0:1], exec
++        0x7DAA_0E80, // v_cmpx_ne_u32 0, v7
++        0xBF88_0011, // s_cbranch_execz END
++        0xBE86_047E, // s_mov_b64 s[6:7], exec
++        0xBE92_0380, // s_mov_b32 s18, 0
++        0xBE91_0380, // s_mov_b32 s17, 0
++        0xBF82_0002, // s_branch BODY
++        0x87FE_0614, // LOOPTOP: s_and_b64 exec, s[20:21], s[6:7]
++        0x7E22_0508, // v_readfirstlane_b32 s17, v8
++        0x8F10_8212, // BODY: s_lshl_b32 s16, s18, 2
++        0x8112_8112, // s_add_i32 s18, s18, 1
++        lds_address, // LDS address for the next subtotal
++        0xD8D8_0000,
++        0x0800_0008, // ds_read_b32 v8, v8
++        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
++        0x4A10_1011, // v_add_nc_u32 v8, s17, v8
++        0xBE94_047E, // s_mov_b64 s[20:21], exec
++        0x7DA4_0E12, // v_cmpx_eq_u32 s18, v7
++        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
++        0xBF85_FFF3, // s_cbranch_scc1 LOOPTOP
++        0xBEFE_0400, // END: s_mov_b64 exec, s[0:1]
++        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
++    ];
++    let mut out = words.to_vec();
++    out.extend([0xE070_1000, 0x800A_0810]); // buffer_store_dword v8, v16, s[40:43], 0 offen
++    out.push(S_ENDPGM);
++    out
++}
++
++/// Lowers [`wave_prefix_program`] in halves for a 32-lane host.
++fn lower_prefix(lane_dependent: bool) -> Result<Lowered, crate::ShaderError> {
++    let words = wave_prefix_program(lane_dependent);
++    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++    let native = NativeProgram {
++        stage: HwStage::Cs,
++        wave64: true,
++        vgprs: 256,
++        layout: vec![root(RootType::Table, 0, 0)],
++        used: vec![UsedResource {
++            kind: ResourceType::Uav,
++            root: RootType::Table,
++            table_offset_dwords: 16,
++            lower_bound: 0,
++            stride: 0,
++            dwords: 4,
++            user_data: 0,
++            slot: 0,
++        }],
++        io: StageIo::Cs(ComputeIo {
++            // One user-data SGPR; 1 KiB of LDS.
++            rsrc2: 2 << 15 | 1 << 1,
++            threads: [256, 1, 1],
++        }),
++        code,
++    };
++    let p = ir::build(&native.code, true, 256).unwrap();
++    let st = structure::structure(&p).unwrap();
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
++    let io = io::raise(&p, &native).unwrap();
++    lower(&Parts {
++        native: &native,
++        p: &p,
++        st: &st,
++        io: &io,
++        res: &res,
++        inputs: vec![],
++        outputs: vec![],
++        prims: vec![],
++        mesh_stride: 0,
++        atomic_locks: false,
++        atomic_lock_rounds: false,
++        atomic_umax: false,
++        bias_as_gradients: false,
++        host_wave32: true,
++        narrow_waves: true,
++        view_marks: false,
++    })
++}
++
++#[test]
++fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
++    // The loop's condition and the running sum are the same in every lane of
++    // a console wave (it is shifted thread ids, LDS at an alike address and
++    // phis of those), so each host wave may take its own first lane.
++    let l = lower_prefix(false).expect("lower the prefix scan in halves");
++    assert_eq!(l.wave_size, Some(32));
++}
++
++#[test]
++fn a_lane_dependent_prefix_cannot_take_its_own_first_lane() {
++    let err = match lower_prefix(true) {
++        Ok(_) => panic!("a lane-dependent prefix took a host wave's first lane"),
++        Err(e) => e.to_string(),
++    };
++    assert!(
++        err.contains("a first-lane read of a value that may differ between 32-lane halves"),
++        "{err}"
++    );
++}
++

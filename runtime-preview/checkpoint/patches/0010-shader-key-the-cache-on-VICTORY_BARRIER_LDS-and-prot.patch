@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 16:30:10 -0500
+Subject: [PATCH 10/15] shader: key the cache on VICTORY_BARRIER_LDS and
+ prototype sampleGrad
+
+The shader cache key did not cover the diagnostic emitter switches, so
+VICTORY_BARRIER_LDS=1 would have reused DXIL emitted with mode 1|2|8. Both
+switches are now read once in victory_shader::emit::{barrier_lds,
+ps_sample_grad} and hashed into the base key, like SOURCE_HASH.
+
+VICTORY_PS_SAMPLE_GRAD=1 is the prototype for the AGX air.sample_ failure:
+a pixel shader's implicit-LOD image_sample (op 60, not cubes or offsets
+past the existing path) is emitted as sampleGrad (63) with derivCoarse
+(83) of each coordinate for both directions. Off by default; the next run
+with VICTORY_PS_SAMPLE_GRAD=1 tells whether the three mesh/pixel pairs
+create. Host tests: the key test covers the two switches; victory-shader
+passes.
+---
+ crates/victory-gpu/src/shader_cache.rs        | 49 ++++++++++---
+ crates/victory-shader/src/emit/lower.rs       | 69 +++++++++++++++++--
+ .../victory-shader/src/emit/lower/halves.rs   |  2 +-
+ crates/victory-shader/src/emit/mod.rs         |  1 +
+ 4 files changed, 104 insertions(+), 17 deletions(-)
+
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index bd71e89..38f1808 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -65,7 +65,14 @@ fn build() -> &'static [u8; 32] {
+                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+             );
+         }
+-        key(victory_shader::SOURCE_HASH, ENCODING, limit, host_wave32())
++        key(
++            victory_shader::SOURCE_HASH,
++            ENCODING,
++            limit,
++            host_wave32(),
++            victory_shader::emit::barrier_lds(),
++            victory_shader::emit::ps_sample_grad(),
++        )
+     })
+ }
+ 
+@@ -79,12 +86,23 @@ fn host_wave32() -> bool {
+ /// This file, whose `encode` and `decode` define the entries.
+ const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
+ 
+-fn key(translator: &str, encoding: &[u8], limit: u32, wave32: bool) -> [u8; 32] {
++fn key(
++    translator: &str,
++    encoding: &[u8],
++    limit: u32,
++    wave32: bool,
++    barrier_lds: bool,
++    ps_sample_grad: bool,
++) -> [u8; 32] {
+     let mut h = blake3::Hasher::new();
+     h.update(translator.as_bytes());
+     h.update(blake3::hash(encoding).as_bytes());
+     h.update(&limit.to_le_bytes());
+     h.update(&[u8::from(wave32)]);
++    // Diagnostic emitter switches that change the DXIL (VICTORY_BARRIER_LDS,
++    // VICTORY_PS_SAMPLE_GRAD): a cached translation from the other setting
++    // must not be served.
++    h.update(&[u8::from(barrier_lds), u8::from(ps_sample_grad)]);
+     *h.finalize().as_bytes()
+ }
+ 
+@@ -656,19 +674,21 @@ mod tests {
+     /// another key, so no entry written before it is read.
+     #[test]
+     fn the_key_covers_translator_encoding_and_settings() {
+-        let k = key("0123456789abcdef", b"encoding", 1 << 20, false);
+-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false));
+-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
++        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, false, false);
++        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false, false));
++        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, false, false));
++        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, false, false));
++        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, false, false));
++        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, false, false));
+         assert_eq!(
+             *build(),
+             key(
+                 victory_shader::SOURCE_HASH,
+                 ENCODING,
+                 victory_shader::emit::loop_limit(),
+-                host_wave32()
++                host_wave32(),
++                victory_shader::emit::barrier_lds(),
++                victory_shader::emit::ps_sample_grad()
+             )
+         );
+         // The encoding part is this file as built.
+@@ -691,6 +711,17 @@ mod tests {
+         files
+     }
+ 
++    #[test]
++    fn diagnostic_emitter_switches_change_the_cache_key() {
++        let base = key("t", b"e", 1, true, false, false);
++        let barrier = key("t", b"e", 1, true, true, false);
++        let sample = key("t", b"e", 1, true, false, true);
++        assert_ne!(base, barrier);
++        assert_ne!(base, sample);
++        assert_ne!(barrier, sample);
++        assert_eq!(base, key("t", b"e", 1, true, false, false));
++    }
++
+     #[test]
+     fn entries_round_trip_and_reject_damage() {
+         let bytes = encode(&Ok(shader()));
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 87a266f..5249902 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -47,9 +47,21 @@ fn barrier_mode(writes_uavs: bool, lds_only: bool) -> u32 {
+ }
+ 
+ /// Whether `VICTORY_BARRIER_LDS=1` leaves barriers TGSM-only (diagnostic for
+-/// the AGX `air.fence_` pipeline creation failure).
+-fn barrier_lds_only() -> bool {
+-    std::env::var("VICTORY_BARRIER_LDS").as_deref() == Ok("1")
++/// the AGX `air.fence_` pipeline creation failure). Part of the shader
++/// cache key ([`victory_gpu`'s] `shader_cache`), so toggling it does not
++/// reuse DXIL emitted with the other mode.
++pub fn barrier_lds() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("VICTORY_BARRIER_LDS").as_deref() == Ok("1"))
++}
++
++/// Whether `VICTORY_PS_SAMPLE_GRAD=1` lowers a pixel shader's implicit-LOD
++/// `sample` to `sampleGrad` with explicit coarse derivatives: D3DMetal on
++/// AGX M1 fails some mesh/PS pipelines with `air.sample_.v4f32`. Part of the
++/// shader cache key.
++pub fn ps_sample_grad() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("VICTORY_PS_SAMPLE_GRAD").as_deref() == Ok("1"))
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -3938,7 +3950,7 @@ impl<'a> Lower<'a> {
+     /// the program writes UAVs (the waits before an s_barrier make those
+     /// writes visible on the console).
+     fn group_barrier(&mut self) {
+-        let mode = barrier_mode(self.writes_uavs, barrier_lds_only());
++        let mode = barrier_mode(self.writes_uavs, barrier_lds());
+         let mode = self.s.m.i32(mode);
+         let void = self.s.t.void;
+         self.s
+@@ -9702,9 +9714,52 @@ impl<'a> Lower<'a> {
+                         }
+                     }
+                     args.extend(&os);
+-                    args.push(fu);
+-                    self.s
+-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
++                    if ps_sample_grad() && self.x.native.stage == HwStage::Ps && kind != 5 {
++                        // Implicit LOD as an explicit gradient: D3DMetal on
++                        // AGX M1 cannot lower the `air.sample_` some
++                        // mesh/PS pipelines become, while `sampleGrad` is
++                        // the same lookup with the coarse derivatives the
++                        // hardware would take.
++                        let mut g = vec![fu; 6];
++                        for k in 0..spatial {
++                            g[k] = self.s.op(
++                                c,
++                                "derivCoarse.f32",
++                                Attr::ReadNone,
++                                self.s.t.f32,
++                                83,
++                                &[cs[k]],
++                            );
++                            g[3 + k] = self.s.op(
++                                c,
++                                "derivCoarse.f32",
++                                Attr::ReadNone,
++                                self.s.t.f32,
++                                83,
++                                &[cs[k]],
++                            );
++                        }
++                        args.extend(g);
++                        args.push(fu);
++                        self.s.op(
++                            c,
++                            "sampleGrad.f32",
++                            Attr::ReadOnly,
++                            self.s.t.res_ret,
++                            63,
++                            &args,
++                        )
++                    } else {
++                        args.push(fu);
++                        self.s.op(
++                            c,
++                            "sample.f32",
++                            Attr::ReadOnly,
++                            self.s.t.res_ret,
++                            60,
++                            &args,
++                        )
++                    }
+                 }
+                 61 => {
+                     let bias = addr_val(self, 0)?;
+diff --git a/crates/victory-shader/src/emit/lower/halves.rs b/crates/victory-shader/src/emit/lower/halves.rs
+index f7e0f16..dedfe5f 100644
+--- a/crates/victory-shader/src/emit/lower/halves.rs
++++ b/crates/victory-shader/src/emit/lower/halves.rs
+@@ -225,7 +225,7 @@ impl Lower<'_> {
+         let high = self.s.m.bin(at, Bin::Or, slot, one);
+         let sync = |l: &mut Self| {
+             // Group sync with a group-shared memory fence.
+-            let mode = l.s.m.i32(barrier_mode(false, barrier_lds_only()));
++            let mode = l.s.m.i32(barrier_mode(false, barrier_lds()));
+             let void = l.s.t.void;
+             l.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+         };
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index e3b40be..6a76f2f 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -260,6 +260,7 @@ mod deltas;
+ mod rect;
+ pub use container::sign as sign_container;
+ pub use deltas::{VERTEX_DELTA_TOP, VERTEX_DELTAS, needs_vertex_deltas, vertex_delta_gs};
++pub use lower::{barrier_lds, ps_sample_grad};
+ pub use rect::{rectangle_gs, right_angle};
+ #[cfg(all(test, windows))]
+ mod memory_tests;

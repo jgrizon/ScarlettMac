@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 14:49:58 -0500
+Subject: [PATCH 03/15] diagnostics: VICTORY_SKIP_SUPPORT_ALERT returns from
+ the title's deadline trap
+
+The intro's Prestream overrun makes the title's stall monitor call its
+ALERT_ERROR_SUPPORT handler at +0x23cf620, which faults on purpose
+("mov dword ptr [0], 0x4d8bd421" at +0x23cf683) about four minutes in.
+With VICTORY_SKIP_SUPPORT_ALERT=1 the handler's entry becomes a stub that
+logs its first firing and returns, and the 11-byte trap after the call at
++0x2215c35 becomes a jump to the monitor loop's continuation at +0x2215c41
+(the same address its own jmp uses). Off by default and only for the known
+b99f876b74d4a77f image; both writes use victory_loader::patch_code and fail
+closed when the original bytes are not found.
+---
+ apps/victory/src/run.rs        | 77 ++++++++++++++++++++++++++++++++++
+ crates/victory-game/src/lib.rs | 39 +++++++++++++++++
+ 2 files changed, 116 insertions(+)
+
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index 148c739..b0e0007 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -35,6 +35,33 @@ fn check_cpu_features() -> Result<()> {
+     check_cpu_features_with(has_avx2, skip.as_deref())
+ }
+ 
++/// Set when `VICTORY_SKIP_SUPPORT_ALERT=1` installs the deadline monitor's
++/// stub; the stub logs only the first time the monitor fires.
++#[cfg(windows)]
++static SUPPORT_ALERT_LOGGED: std::sync::atomic::AtomicBool =
++    std::sync::atomic::AtomicBool::new(false);
++
++/// When the stub was installed, so the first firing can say how far into the
++/// run it came.
++#[cfg(windows)]
++static SUPPORT_ALERT_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++
++/// Replaces the title's ALERT_ERROR_SUPPORT handler entry. The deadline
++/// monitor calls the handler through its fatal-handler slot; this logs once
++/// and returns, and the trap after the call is patched to jump into the
++/// monitor's loop, so a Prestream overrun no longer kills the run.
++#[cfg(windows)]
++extern "system" fn support_alert_skipped() {
++    if !SUPPORT_ALERT_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
++        let secs = SUPPORT_ALERT_START
++            .get()
++            .map_or(0.0, |start| start.elapsed().as_secs_f64());
++        println!(
++            "support alert  deadline monitor fired at {secs:.1}s; handler returned, trap skipped"
++        );
++    }
++}
++
+ #[cfg(windows)]
+ pub fn run(
+     exe: &Path,
+@@ -173,6 +200,56 @@ pub fn run(
+         // SAFETY: the image stays mapped and nothing of it has run yet.
+         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+     }
++    // The title's stall/deadline monitor kills the run about four minutes in
++    // (ALERT_ERROR_SUPPORT) while the intro's Prestream list overruns. Opt-in
++    // only (`VICTORY_SKIP_SUPPORT_ALERT=1`): its handler returns instead of
++    // faulting, and the trap after the call jumps back into the monitor's
++    // loop.
++    #[cfg(windows)]
++    if std::env::var("VICTORY_SKIP_SUPPORT_ALERT").ok().as_deref() == Some("1") {
++        match known.and_then(|b| b.support_alert) {
++            Some(alert) => {
++                let mut stub = Vec::with_capacity(alert.handler_original.len());
++                stub.extend_from_slice(&[0x48, 0x83, 0xec, 0x28]); // sub rsp, 0x28
++                stub.push(0x48);
++                stub.push(0xb8); // mov rax, imm64
++                stub.extend_from_slice(
++                    &(support_alert_skipped as *const () as usize as u64).to_le_bytes(),
++                );
++                stub.extend_from_slice(&[0xff, 0xd0]); // call rax
++                stub.extend_from_slice(&[0x48, 0x83, 0xc4, 0x28]); // add rsp, 0x28
++                stub.push(0xc3); // ret
++                let handler = stub.len() == alert.handler_original.len()
++                    && victory_loader::patch_code(
++                        image.base() as u64,
++                        alert.handler_rva,
++                        alert.handler_original,
++                        &stub,
++                    );
++                let trap = victory_loader::patch_code(
++                    image.base() as u64,
++                    alert.trap.rva,
++                    alert.trap.original,
++                    alert.trap.replacement,
++                );
++                if handler && trap {
++                    SUPPORT_ALERT_START.get_or_init(std::time::Instant::now);
++                    println!(
++                        "support alert  skipped (VICTORY_SKIP_SUPPORT_ALERT=1): \
++                         handler at +{:#x} returns, trap at +{:#x} jumped",
++                        alert.handler_rva, alert.trap.rva
++                    );
++                } else {
++                    println!(
++                        "support alert  left as it is: handler {}, trap {} at the expected bytes",
++                        if handler { "patched" } else { "not found" },
++                        if trap { "patched" } else { "not found" },
++                    );
++                }
++            }
++            None => println!("support alert  left as it is: unknown build"),
++        }
++    }
+     // Masked stores redone as plain stores Rosetta can resume, so fault
+     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
+     if let (Some(which), Some(original)) = (patching, original) {
+diff --git a/crates/victory-game/src/lib.rs b/crates/victory-game/src/lib.rs
+index a03a84b..e86b99b 100644
+--- a/crates/victory-game/src/lib.rs
++++ b/crates/victory-game/src/lib.rs
+@@ -29,6 +29,26 @@ pub struct KnownBuild {
+     /// under Rosetta without them, and with them the runtime turns it on.
+     /// Empty for a build whose stores the scan covers.
+     pub plain_stores: &'static str,
++    /// Where the title's stall/deadline monitor calls its fatal
++    /// ALERT_ERROR_SUPPORT handler, patched by `VICTORY_SKIP_SUPPORT_ALERT=1`.
++    pub support_alert: Option<SupportAlert>,
++}
++
++/// The title's stall/deadline monitor call and the trap behind it.
++///
++/// When a Prestream overruns, the monitor loads its handler from a slot and
++/// calls it; the handler (ALERT_ERROR_SUPPORT) faults on purpose. With
++/// `VICTORY_SKIP_SUPPORT_ALERT=1` the runtime replaces the handler's entry
++/// with a stub that logs once and returns, and rewrites the store after the
++/// call as a jump back into the monitor's loop, so the run stays alive.
++#[derive(Debug, Clone, Copy)]
++pub struct SupportAlert {
++    /// RVA of the handler's entry.
++    pub handler_rva: u32,
++    /// The handler's first bytes, which the stub replaces (same length).
++    pub handler_original: &'static [u8],
++    /// The trap after the call: `mov dword ptr [0], 0`.
++    pub trap: CodePatch,
+ }
+ 
+ /// Bytes to replace at an RVA of the mapped image, applied only where the
+@@ -68,6 +88,25 @@ pub const KNOWN_BUILDS: &[KnownBuild] = &[KnownBuild {
+     // `vmovups`/`vmovupd`/`vmovdqu` stores that begin in writable memory and
+     // run into a protected page, which Rosetta cannot resume either (#144).
+     plain_stores: "1e09b31,1e09b37,259509f,25950a5,1e759f0,1e759f7,1e759fe,1e75a05",
++    // The intro cutscene's deadline monitor aborts about four minutes into a
++    // run while `fbk_stry000_FBK_STRY000_INTRO` is still in Prestream: through
++    // the slot at 0x71b6348 it calls 0x23cf620, which formats
++    // ALERT_ERROR_SUPPORT_0x%x and stores a magic at address 0. Returning from
++    // that call lands on `mov dword ptr [0], 0` at 0x2215c35, then `int3`;
++    // the monitor's loop continues at 0x2215c41 (`mov rax, r15`).
++    support_alert: Some(SupportAlert {
++        handler_rva: 0x23cf620,
++        handler_original: &[
++            0x48, 0x83, 0xec, 0x48, 0xe8, 0x77, 0x48, 0x0b, 0x00, 0x48, 0x8d, 0x54, 0x24, 0x28,
++            0x48, 0xb9, 0x3b, 0x45, 0x4b, 0x17, 0x44,
++        ],
++        // 11-byte store -> 5-byte jump to 0x2215c41 + 6 NOPs.
++        trap: CodePatch {
++            rva: 0x2215c35,
++            original: &[0xc7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
++            replacement: &[0xe9, 0x07, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90],
++        },
++    }),
+ }];
+ 
+ /// Looks up a build by the BLAKE3 hash of its executable.

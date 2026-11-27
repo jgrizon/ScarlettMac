@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ScarlettMac <scarlettmac@local>
+Date: Thu, 26 Nov 2026 16:16:03 -0500
+Subject: [PATCH 09/15] gpu: VICTORY_SPILL_ONLY keeps just the named shader
+ containers
+
+With VICTORY_SPILL_SHADERS=1 the title's tens of thousands of containers
+would fill the cache; VICTORY_SPILL_ONLY=a0f0a3c9,7778fb12 keeps only
+those whose BLAKE3 starts with one of the prefixes. For correlating an
+AGXMetal 'unlowered function call' pipeline with the DXIL we emitted: the
+log's 16-hex hash is the container hash's prefix, so one diagnostic run
+yields exactly the failing containers to translate offline.
+---
+ crates/victory-gpu/src/pipeline.rs | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index 7e87796..3f443c4 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -119,6 +119,24 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+ #[cfg(windows)]
+ static SPILL_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+ 
++/// The hash prefixes `VICTORY_SPILL_ONLY` keeps (comma-separated), if set.
++#[cfg(windows)]
++fn spill_only() -> Option<&'static [String]> {
++    static ONLY: OnceLock<Vec<String>> = OnceLock::new();
++    let list = ONLY.get_or_init(|| {
++        std::env::var("VICTORY_SPILL_ONLY")
++            .map(|v| {
++                v.split(',')
++                    .map(str::trim)
++                    .filter(|p| !p.is_empty())
++                    .map(str::to_owned)
++                    .collect()
++            })
++            .unwrap_or_default()
++    });
++    (!list.is_empty()).then_some(list.as_slice())
++}
++
+ /// The file a container with BLAKE3 `full` is kept in.
+ #[cfg(windows)]
+ fn spill_path(dir: &std::path::Path, full: &[u8; 32]) -> std::path::PathBuf {
+@@ -139,6 +157,14 @@ fn spill(shader: &Shader, full: &[u8; 32]) {
+ /// [`spill`] into `dir`.
+ #[cfg(windows)]
+ fn spill_to(dir: &std::path::Path, shader: &Shader, full: &[u8; 32]) {
++    // `VICTORY_SPILL_ONLY=7778fb12,a0f0a3c9`: keep only the containers whose
++    // hash starts with one of these (for looking at one failing pipeline).
++    if let Some(only) = spill_only() {
++        let hex = blake3::Hash::from(*full).to_hex();
++        if !only.iter().any(|p| hex.starts_with(p)) {
++            return;
++        }
++    }
+     let path = spill_path(dir, full);
+     let there = std::fs::File::open(&path).is_ok();
+     if !there {

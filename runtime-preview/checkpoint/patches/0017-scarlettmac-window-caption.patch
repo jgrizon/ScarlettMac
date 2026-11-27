@@ -1,0 +1,132 @@
+diff --git a/crates/victory-gpu/src/caption.rs b/crates/victory-gpu/src/caption.rs
+index 0086e6e5bb13b3a499f0cc0b3621f6d0006ae7a8..fca31e547aaa6fc0596abef22b691c35c4bdf439 100644
+--- a/crates/victory-gpu/src/caption.rs
++++ b/crates/victory-gpu/src/caption.rs
+@@ -1,67 +1,19 @@
+-//! The visible window caption: the title's text followed by our statistics.
+-
+-const SEPARATOR: &str = " | ScarlettMac ";
+-
+-/// Replaces the suffix left by an earlier presenter. A replacement swap
+-/// chain reads the visible caption, which already contains that suffix.
+-pub(crate) fn with_stats(caption: &[u16], stats: &str) -> Vec<u16> {
+-    let separator: Vec<u16> = SEPARATOR.encode_utf16().collect();
+-    let base_len = caption
+-        .windows(separator.len())
+-        .enumerate()
+-        .rev()
+-        .find(|(at, part)| {
+-            **part == separator[..] && looks_like_stats(&caption[*at + separator.len()..])
+-        })
+-        .map_or(caption.len(), |(at, _)| at);
+-    caption[..base_len]
+-        .iter()
+-        .copied()
+-        .chain(separator)
+-        .chain(stats.encode_utf16())
+-        .collect()
+-}
+-
+-/// Whether `text` has the exact shape Meter appends. The separator alone is
+-/// not enough: a title's own caption may contain ` | ScarlettMac `.
+-fn looks_like_stats(text: &[u16]) -> bool {
+-    let Ok(text) = String::from_utf16(text) else {
+-        return false;
+-    };
+-    let mut words = text.split_whitespace();
+-    words.next().is_some_and(|v| v.parse::<u64>().is_ok())
+-        && words.next() == Some("fps")
+-        && words.next().is_some_and(|v| v.parse::<f64>().is_ok())
+-        && words.next() == Some("ms/frame")
+-        && words.next().is_some_and(|v| v.parse::<u64>().is_ok())
+-        && words.next() == Some("draws/frame")
+-        && words.next().is_none()
++pub(crate) fn with_stats(stats: &str) -> Vec<u16> {
++    "ScarlettMac ".encode_utf16().chain(stats.encode_utf16()).collect()
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::with_stats;
+ 
+-    fn text(wide: &[u16]) -> String {
+-        String::from_utf16_lossy(wide)
+-    }
+-
+     #[test]
+-    fn statistics_replace_the_previous_suffix_and_preserve_the_base_title() {
+-        let base = "Synthetic base | ScarlettMac base | window";
+-        let mut caption: Vec<u16> = base.encode_utf16().collect();
+-
+-        caption = with_stats(&caption, "0 fps 2973.1 ms/frame 4456 draws/frame");
+-        assert_eq!(
+-            text(&caption),
+-            "Synthetic base | ScarlettMac base | window | ScarlettMac 0 fps 2973.1 ms/frame 4456 draws/frame"
+-        );
+-
+-        // A replacement presenter reads the caption left by the previous one.
+-        caption = with_stats(&caption, "1 fps 1425.4 ms/frame 4715 draws/frame");
+-        assert_eq!(
+-            text(&caption),
+-            "Synthetic base | ScarlettMac base | window | ScarlettMac 1 fps 1425.4 ms/frame 4715 draws/frame"
+-        );
++    fn captions_show_only_scarlettmac_and_current_statistics() {
++        for stats in [
++            "0 fps 2973.1 ms/frame 4456 draws/frame",
++            "1 fps 1425.4 ms/frame 4715 draws/frame",
++        ] {
++            let caption = String::from_utf16(&with_stats(stats)).unwrap();
++            assert_eq!(caption, format!("ScarlettMac {stats}"));
++        }
+     }
+ }
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index f9d4ecb907d966c99e7585761077091f3d097277..8d1350622e5a6cceca6766f2adc92fc5b2a84b5d 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -4230,8 +4230,6 @@ struct Meter {
+     frames: u64,
+     caption_window: FrameWindow,
+     report_window: FrameWindow,
+-    /// The caption the window had, once read.
+-    caption: Option<Vec<u16>>,
+ }
+ 
+ impl Meter {
+@@ -4245,7 +4243,6 @@ impl Meter {
+             frames: 0,
+             caption_window: start,
+             report_window: start,
+-            caption: None,
+         }
+     }
+ 
+@@ -4369,18 +4366,9 @@ impl Meter {
+                 }
+             }
+         }
+-        if self.caption.is_none() {
+-            // The window's own text, read without a message.
+-            let mut buffer = vec![0u16; 512];
+-            // SAFETY: a window handle and a buffer of that length.
+-            let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
+-            buffer.truncate(n.max(0) as usize);
+-            self.caption = Some(buffer);
+-        }
+-        let Some(caption) = &self.caption else { return };
+         let FrameRates { fps, ms, draws, .. } = caption_rates;
+         let text = format!("{fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+-        let mut text: Vec<u16> = crate::caption::with_stats(caption, &text);
++        let mut text = crate::caption::with_stats(&text);
+         text.push(0);
+         // Setting the text waits for the window's thread (a title thread,
+         // which may not pump for a while), so a thread of ours does it and
+@@ -5071,7 +5059,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
+         CreateWindowExW(
+             WINDOW_EX_STYLE(0),
+             CLASS,
+-            w!("VIctory"),
++            w!("ScarlettMac"),
+             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+             CW_USEDEFAULT,
+             CW_USEDEFAULT,

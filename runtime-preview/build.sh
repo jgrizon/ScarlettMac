@@ -6,6 +6,9 @@ recipe=$bundle
 if [ "${1-}" = --checkpoint ]; then
     recipe=$bundle/checkpoint
     shift
+elif [ "${1-}" = --perf ]; then
+    recipe=$bundle/perf
+    shift
 fi
 mode=build
 if [ "${1-}" = --prepare ]; then
@@ -13,7 +16,7 @@ if [ "${1-}" = --prepare ]; then
     shift
 fi
 if [ "$#" -ne 1 ]; then
-    printf 'Usage: %s [--checkpoint] [--prepare] NEW_SOURCE_DIR\n' "$0" >&2
+    printf 'Usage: %s [--checkpoint|--perf] [--prepare] NEW_SOURCE_DIR\n' "$0" >&2
     exit 2
 fi
 
@@ -65,8 +68,13 @@ export CC_x86_64_pc_windows_gnullvm="$cross_clang"
 export AR_x86_64_pc_windows_gnullvm="$cross_ar"
 export CARGO_TARGET_DIR="$PWD/target"
 target=x86_64-pc-windows-gnullvm
+profile=${SCARLETTMAC_BUILD_PROFILE:-diag}
+set --
+if [ "$profile" = diag ]; then
+    set -- --features diagnostics
+fi
 cargo build --locked --jobs "${SCARLETTMAC_BUILD_JOBS:-2}" --target "$target" \
-    --profile diag --features diagnostics -p victory
-output=$CARGO_TARGET_DIR/$target/diag
+    --profile "$profile" "$@" -p victory
+output=$CARGO_TARGET_DIR/$target/$profile
 cp -- "$cross_unwind" "$output/libunwind.dll"
 printf '%s\n' "$output/victory.exe"

@@ -28,14 +28,19 @@ if [[ $(git -C "$source" rev-parse HEAD) != "$revision" ]]; then
     print -u2 "Unexpected XCL source revision in $source"
     exit 1
 fi
+apply_patch_once() {
+    if git -C "$source" apply --reverse --check "$1" 2>/dev/null; then
+        return
+    fi
+    git -C "$source" apply "$1"
+}
 prepare_patches() {
     if [[ $mode == --lanes ]] && git -C "$source" apply --reverse --check "$lanes_patch" 2>/dev/null; then
         return
     fi
-    if git -C "$source" apply --check "$patch" 2>/dev/null; then
-        git -C "$source" apply "$patch"
-    else
-        git -C "$source" apply --reverse --check "$patch"
+    apply_patch_once "$patch"
+    if [[ $mode == --test-title ]]; then
+        apply_patch_once "$root/patches/test-title-readback.patch"
     fi
     if [[ $mode == --lanes ]]; then
         git -C "$source" apply "$lanes_patch"
